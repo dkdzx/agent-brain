@@ -23,11 +23,13 @@ verified and reconstructed.
 
 ## Implementation status
 
-Version `0.1.0` includes an executable reference core:
+Version `0.2.0` includes an executable reference core:
 
 | Capability | Status |
 |---|---|
 | Append-only workgroup runtime and leases | Implemented and exercised |
+| Strict per-turn context/version protocol | Implemented and exercised |
+| Single active workgroup per task identity by default | Implemented and exercised |
 | Independent workgroup verifier | Implemented and exercised |
 | Read-only local status page | Implemented and smoke-tested |
 | Provenance-aware local memory ledger | Implemented and tested |
@@ -64,7 +66,8 @@ cd agent-brain
 python examples/three_agent_demo.py
 ```
 
-The demo creates a temporary controller/worker/reviewer workgroup, records a
+The demo creates a temporary controller/worker/reviewer workgroup, requires
+each writer to acknowledge the current shared `view_version`, records a
 disagreement, resolves it append-only, discards the in-process context,
 freezes the result, creates a handoff, revokes all members, and runs an
 independent verifier.
@@ -103,6 +106,12 @@ Removed, expired, and revoked members are omitted from the visible workgroup
 member list. Their lifecycle remains reconstructable from the append-only
 event archive.
 
+New workgroups default to `strict` coordination. Every `post` and `resolve`
+must carry the `expected_view_version` returned by that member's most recent
+`context` call. A concurrent member update makes the old context stale and the
+write fails closed until the member rereads shared state. The same
+`host_id + thread_id` also belongs to only one writable workgroup by default.
+
 ## CLI
 
 ```text
@@ -116,6 +125,13 @@ freeze
 handoff
 close
 status
+```
+
+In strict mode, the normal turn protocol is:
+
+```text
+context → work → post/resolve --expected-view-version N
+        → CONTEXT_STALE means reread and reconsider before publishing
 ```
 
 Example:
@@ -150,6 +166,7 @@ python src/agent_brain/long_term_memory.py --root .demo-memory query `
 ```text
 src/agent_brain/
   workgroup_brain.py            append-only workgroup runtime
+                                plus strict context/version gate
   verify_workgroup_brain.py     independent reader/verifier
   workgroup_status_frontend.py  read-only local status page
   long_term_memory.py           provenance-aware memory ledger
@@ -163,7 +180,8 @@ docs/
   overview.md
   reproduction-guide.md
 assets/
-  architecture-en.png
+  architecture-en.mmd           editable source based on the original diagram
+  architecture-en.png           rendered architecture diagram
 ```
 
 ## Documentation
