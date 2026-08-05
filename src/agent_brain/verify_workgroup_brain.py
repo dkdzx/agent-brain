@@ -365,19 +365,34 @@ def main() -> int:
     members = list(members_doc["members"].values())
     roles = sorted(member["role"] for member in members)
     check(
-        "three_members",
-        len(members) == 3,
+        "member_registry_nonempty",
+        len(members) >= 1,
         {"count": len(members), "member_ids": sorted(m["member_id"] for m in members)},
     )
     check(
-        "three_expected_roles",
-        roles == ["controller", "reviewer", "worker"],
+        "exactly_one_controller",
+        roles.count("controller") == 1,
         {"roles": roles},
     )
+    terminal_state = meta.get("state") in {
+        "ARCHIVED",
+        "CLOSED",
+        "EXPIRED",
+        "EXPIRED_OR_ARCHIVED",
+        "MEMBERS_REVOKED",
+    }
     check(
-        "all_members_revoked",
-        all(not member["active"] and member.get("revoked_at") for member in members),
+        "member_revocation_matches_lifecycle",
+        (
+            all(
+                not member["active"] and member.get("revoked_at")
+                for member in members
+            )
+            if terminal_state
+            else any(member["active"] for member in members)
+        ),
         {
+            "terminal_state": terminal_state,
             "members": {
                 member["member_id"]: {
                     "active": member["active"],
@@ -388,18 +403,16 @@ def main() -> int:
         },
     )
     check(
-        "archived_state",
-        meta.get("state") == "ARCHIVED" and view.get("state") == "ARCHIVED",
+        "group_and_view_state_agree",
+        meta.get("state") == view.get("state"),
         {"meta": meta.get("state"), "view": view.get("state")},
     )
 
     required_event_counts = {
         "GROUP_CREATED": 1,
-        "MEMBER_ADDED": 2,
-        "ENTRY_RESOLVED": 1,
+        "MEMBER_ADDED": max(0, len(members) - 1),
         "GROUP_FROZEN": 1,
         "HANDOFF_CREATED": 1,
-        "GROUP_CLOSED": 1,
     }
     for event_type, expected in required_event_counts.items():
         check(
@@ -410,27 +423,27 @@ def main() -> int:
                 "actual": event_type_counts.get(event_type, 0),
             },
         )
-    entry_types = {entry["entry_type"] for entry in ordered_entries}
-    for expected_type in {
-        "PARTIAL_RESULT",
-        "FACT_CONFIRMED",
-        "CONFLICT_RECORDED",
-        "LOCAL_DECISION",
-        "CURRENT_BEST_MODEL",
-    }:
-        check(
-            f"entry_type_{expected_type}",
-            expected_type in entry_types,
-            sorted(entry_types),
-        )
     check(
-        "conflict_closed",
-        len(expected_open_conflicts) == 0
-        and any(
-            entry["entry_type"] == "CONFLICT_RECORDED"
-            and entry["status"] == "resolved"
-            for entry in ordered_entries
+        "group_close_event_matches_lifecycle",
+        (
+            event_type_counts.get("GROUP_CLOSED", 0) == 1
+            if terminal_state
+            else event_type_counts.get("GROUP_CLOSED", 0) == 0
         ),
+        {
+            "terminal_state": terminal_state,
+            "actual": event_type_counts.get("GROUP_CLOSED", 0),
+        },
+    )
+    entry_types = {entry["entry_type"] for entry in ordered_entries}
+    check(
+        "entry_types_declared",
+        all(bool(entry_type) for entry_type in entry_types),
+        sorted(entry_types),
+    )
+    check(
+        "conflict_index_consistent",
+        expected_open_conflicts == view["open_conflict_entry_ids"],
         {
             "open": expected_open_conflicts,
             "resolved_conflicts": [

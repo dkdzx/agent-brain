@@ -1,0 +1,76 @@
+{
+  "schema_version": "agent_brain_workgroup_dispatch_contract_v5",
+  "dispatch_contract_version": 5,
+  "experiment_id": "workgroup-memory-v5-canary",
+  "purpose": "Isolated simulation of bounded workgroup memory, durable group candidates, archival recovery, and LoopX-style task binding.",
+  "isolation": {
+    "main_root": "./example-project-root",
+    "worktree_root": "./sandbox/worktree",
+    "experiment_root": "./sandbox/worktree/experiment",
+    "runtime_root": "./sandbox/runtime",
+    "forbidden_runtime_roots": [
+      "./production-runtime",
+      "./production-control"
+    ],
+    "forbidden_identifiers": [
+      "production-goal",
+      "archived-production-group"
+    ]
+  },
+  "canary": {
+    "group_id": "v5-canary-group-001",
+    "task_id": "V5-CANARY-TASK-001",
+    "member_ids": [
+      "v5-controller",
+      "v5-reviewer"
+    ],
+    "source_thread_ids": [
+      "v5-thread-controller",
+      "v5-thread-reviewer"
+    ],
+    "event_target": 240,
+    "compaction_event_threshold": 200,
+    "context_budget_bytes": 8192,
+    "context_max_entries": 20,
+    "simulate_abrupt_interruption_after": 120,
+    "simulate_early_close": true,
+    "retention": "archive"
+  },
+  "loopx_binding": {
+    "project_id": "v5-sandbox-project",
+    "goal_id": "v5-canary-goal-001",
+    "primary_todo_id": "v5-canary-todo-001",
+    "child_todo_ids": [
+      "v5-canary-child-todo-001"
+    ],
+    "claim_id": "v5-canary-claim-001"
+  },
+  "policy": {
+    "project_control_write": false,
+    "automatic_project_promotion": false,
+    "graphiti_production": false,
+    "raw_chat_or_session_storage": false,
+    "plaintext_lease_token_storage": false,
+    "current_loopx_state_write": false,
+    "current_archived_group_read": false,
+    "frontend_start": false
+  },
+  "write_targets": [
+    "./sandbox/worktree/experiment",
+    "./sandbox/runtime"
+  ],
+  "required_outputs": [
+    "TASK_DISPATCH_GATE_RECEIPT.json",
+    "CANARY_RECEIPT.json",
+    "events.jsonl",
+    "working_snapshot.json",
+    "group_memory_candidates.jsonl",
+    "group_memory_index.json",
+    "loopx_bindings.json",
+    "STABLE_HANDOFF.json",
+    "CONTEXT_BUDGET_COMPARISON.json",
+    "RECOVERY_RECEIPT.json",
+    "EXTERNAL_READER_REPORT.json",
+    "REVERSE_REVIEW.md"
+  ]
+}
