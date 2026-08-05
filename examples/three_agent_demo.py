@@ -46,6 +46,31 @@ def auth(member: str, token: str, host: str, thread: str) -> list[str]:
     ]
 
 
+def context_version(member_auth: list[str], scope: str = "task/shared") -> int:
+    context = brain(
+        "context",
+        "--group-id",
+        GROUP_ID,
+        *member_auth,
+        "--scope",
+        scope,
+    )
+    return context["view_version"]
+
+
+def coordinated_post(member_auth: list[str], *args: str) -> dict:
+    version = context_version(member_auth)
+    return brain(
+        "post",
+        "--group-id",
+        GROUP_ID,
+        *member_auth,
+        "--expected-view-version",
+        str(version),
+        *args,
+    )
+
+
 def main() -> int:
     if RUNTIME.exists():
         shutil.rmtree(RUNTIME)
@@ -157,11 +182,8 @@ def main() -> int:
         "synthetic-thread-controller",
     )
 
-    brain(
-        "post",
-        "--group-id",
-        GROUP_ID,
-        *worker_auth,
+    coordinated_post(
+        worker_auth,
         "--entry-type",
         "PARTIAL_RESULT",
         "--subject-key",
@@ -175,11 +197,8 @@ def main() -> int:
         "--confidence",
         "0.85",
     )
-    brain(
-        "post",
-        "--group-id",
-        GROUP_ID,
-        *worker_auth,
+    coordinated_post(
+        worker_auth,
         "--entry-type",
         "FACT_CONFIRMED",
         "--subject-key",
@@ -193,11 +212,8 @@ def main() -> int:
         "--confidence",
         "1",
     )
-    conflict = brain(
-        "post",
-        "--group-id",
-        GROUP_ID,
-        *reviewer_auth,
+    conflict = coordinated_post(
+        reviewer_auth,
         "--entry-type",
         "CONFLICT_RECORDED",
         "--subject-key",
@@ -211,11 +227,8 @@ def main() -> int:
         "--confidence",
         "0.9",
     )
-    brain(
-        "post",
-        "--group-id",
-        GROUP_ID,
-        *controller_auth,
+    coordinated_post(
+        controller_auth,
         "--entry-type",
         "LOCAL_DECISION",
         "--subject-key",
@@ -227,11 +240,8 @@ def main() -> int:
         "--confidence",
         "1",
     )
-    brain(
-        "post",
-        "--group-id",
-        GROUP_ID,
-        *controller_auth,
+    coordinated_post(
+        controller_auth,
         "--entry-type",
         "CURRENT_BEST_MODEL",
         "--subject-key",
@@ -243,11 +253,16 @@ def main() -> int:
         "--confidence",
         "0.8",
     )
+    controller_resolve_version = context_version(controller_auth)
     brain(
         "resolve",
         "--group-id",
         GROUP_ID,
         *controller_auth,
+        "--scope",
+        "task/shared",
+        "--expected-view-version",
+        str(controller_resolve_version),
         "--target-entry-id",
         conflict["entry_id"],
         "--status",

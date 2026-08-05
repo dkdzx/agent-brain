@@ -141,6 +141,7 @@
 │  ├─ <group_id>/
 │  │  ├─ group.json
 │  │  ├─ members.json
+│  │  ├─ coordination.json
 │  │  ├─ events.jsonl
 │  │  ├─ view.json
 │  │  ├─ FROZEN_SNAPSHOT.json
@@ -433,9 +434,11 @@ lease_hours
 expires_hours
 authority_bundle_sha256
 coordination_goal_id
+coordination_mode                    # strict为默认
+allow_concurrent_groups              # 默认false
 ```
 
-输出一次性`controller_lease_token`。重复创建同一`group_id`必须失败，除非输入完全相同且明确使用幂等参数。
+输出一次性`controller_lease_token`。重复创建同一`group_id`必须失败；同一`host_id + thread_id`默认也只能处于一个可写工作组，只有显式`allow_concurrent_groups`才能覆盖。
 
 ### 5.2 `add-member`
 
@@ -473,7 +476,8 @@ requested_scope
 - 未解决冲突；
 - 冻结的长期记忆切片；
 - 证据指针；
-- 当前语义Hash。
+- 当前语义Hash；
+- 当前`view_version`，作为本轮发布依据。
 
 不得返回：
 
@@ -485,11 +489,14 @@ requested_scope
 
 ### 5.4 `post`
 
-成员只能追加自己scope内的有类型事件。每次成功后：
+成员只能追加自己scope内的有类型事件。严格模式下必须同时提交从最近一次`context`得到的`expected_view_version`。如果该成员没有先读取、读取scope不覆盖写入scope，或期间其他成员已经产生新版本，分别以`CONTEXT_NOT_SYNCED`、`CONTEXT_SCOPE_NOT_SYNCED`或`CONTEXT_STALE`失败关闭。
+
+每次成功后：
 
 ```text
 锁定事件源
 → 校验哈希链和seq
+→ 校验expected_view_version等于当前版本
 → 追加事件
 → fsync
 → 重建view
@@ -499,7 +506,7 @@ requested_scope
 
 ### 5.5 `resolve`
 
-仅controller或reviewer可用。它不能删除冲突，只能追加：
+仅controller或reviewer可用，同样必须携带最新`expected_view_version`。它不能删除冲突，只能追加：
 
 - `QUESTION_RESOLVED`
 - `HYPOTHESIS_REJECTED`
@@ -573,18 +580,21 @@ long_term_memory_automatic_writes_zero
 开始工作前：
 1. 使用可信身份调用context；
 2. 读取当前任务、共享快照、未解决冲突和证据指针；
-3. 不依赖对话记忆猜测工作组状态。
+3. 保存本轮context返回的view_version；
+4. 不依赖对话记忆猜测工作组状态。
 
 工作过程中：
-4. 重要事实、阶段结果、问题、冲突和工件立即使用post追加；
-5. 不记录隐藏思维链和冗长聊天；
-6. 不静默覆盖其他成员的结论；
-7. 超出scope时追加SCOPE_WARNING并停止越界施工。
+5. 发布前携带expected_view_version；
+6. 若返回CONTEXT_STALE，重新context并重新判断结果，不得盲目重试；
+7. 重要事实、阶段结果、问题、冲突和工件立即使用post追加；
+8. 不记录隐藏思维链和冗长聊天；
+9. 不静默覆盖其他成员的结论；
+10. 超出scope时追加SCOPE_WARNING并停止越界施工。
 
 结束前：
-8. 发布PARTIAL_RESULT或HANDOFF_READY；
-9. 附上可复核证据；
-10. 不自行修改项目正式真值或长期记忆。
+11. 发布PARTIAL_RESULT或HANDOFF_READY；
+12. 附上可复核证据；
+13. 不自行修改项目正式真值或长期记忆。
 ```
 
 推荐把以下内容写成机器生成的成员上下文，而不是人工长提示词：
@@ -597,6 +607,7 @@ objective
 assigned_task
 frozen_authority_hash
 current_view_hash
+current_view_version
 current_facts
 current_hypotheses
 open_conflicts
@@ -1172,7 +1183,10 @@ unredacted_private_data
 15. handoff试图直接写项目权威；
 16. 工作组事件试图自动写长期记忆；
 17. 前端接口泄露`host_id`、`thread_id`或令牌；
-18. 删除`view.json`后重建得到不同语义Hash。
+18. 删除`view.json`后重建得到不同语义Hash；
+19. 未先调用`context`就发布；
+20. 使用过期`expected_view_version`发布；
+21. 同一`host_id + thread_id`默认加入两个活动工作组。
 
 每个负例必须记录：
 
@@ -1270,12 +1284,22 @@ $reviewerToken = $reviewer.lease_token
 ### 13.3 施工成员发布阶段结果
 
 ```powershell
+$workerContext = & $python $brain --root $runtime context `
+  --group-id demo-group-001 `
+  --member-id worker-001 `
+  --lease-token $workerToken `
+  --host-id host-worker `
+  --thread-id thread-worker `
+  --scope task/shared |
+  ConvertFrom-Json
+
 $partial = & $python $brain --root $runtime post `
   --group-id demo-group-001 `
   --member-id worker-001 `
   --lease-token $workerToken `
   --host-id host-worker `
   --thread-id thread-worker `
+  --expected-view-version $workerContext.view_version `
   --entry-type PARTIAL_RESULT `
   --subject-key demo.interface `
   --scope task/shared `
@@ -1319,6 +1343,7 @@ $conflict = & $python $brain --root $runtime post `
   --lease-token $reviewerToken `
   --host-id host-reviewer `
   --thread-id thread-reviewer `
+  --expected-view-version $reviewerContext.view_version `
   --entry-type CONFLICT_RECORDED `
   --subject-key demo.interface `
   --scope task/shared `

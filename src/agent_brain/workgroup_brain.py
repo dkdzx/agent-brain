@@ -25,6 +25,8 @@ from typing import Any, Iterable
 
 
 SCHEMA_VERSION = "agent_brain_workgroup_runtime_v1"
+COORDINATION_SCHEMA_VERSION = "agent_brain_workgroup_coordination_v1"
+COORDINATION_MODES = {"strict", "legacy"}
 ROLES = {"controller", "worker", "reviewer", "observer"}
 ENTRY_TYPES = {
     "FACT_CONFIRMED",
@@ -184,6 +186,134 @@ def group_dir_for(root: Path, group_id: str) -> Path:
     if root_resolved != result.parent:
         raise BrainError("INVALID_GROUP_PATH", "group must be a direct child of root")
     return result
+
+
+def find_active_identity_membership(
+    root: Path,
+    *,
+    host_id: str,
+    thread_id: str,
+    exclude_group_id: str | None = None,
+) -> str | None:
+    """Return another writable group that already owns this task identity."""
+    if not root.exists():
+        return None
+    for candidate in sorted(root.iterdir(), key=lambda item: item.name):
+        if not candidate.is_dir() or candidate.name == exclude_group_id:
+            continue
+        meta_path = candidate / "group.json"
+        members_path = candidate / "members.json"
+        if not meta_path.exists() or not members_path.exists():
+            continue
+        try:
+            meta = read_json(meta_path)
+            members_doc = read_json(members_path)
+        except BrainError:
+            continue
+        if meta.get("state") not in WRITABLE_STATES:
+            continue
+        for member in members_doc.get("members", {}).values():
+            if (
+                member.get("active") is True
+                and member.get("host_id") == host_id
+                and member.get("thread_id") == thread_id
+            ):
+                return str(meta.get("group_id", candidate.name))
+    return None
+
+
+def coordination_document(
+    group_id: str,
+    mode: str,
+    member_ids: Iterable[str],
+) -> dict[str, Any]:
+    return {
+        "schema_version": COORDINATION_SCHEMA_VERSION,
+        "group_id": group_id,
+        "mode": mode,
+        "members": {
+            member_id: {
+                "last_context_view_version": None,
+                "last_context_at": None,
+                "last_context_scope": None,
+            }
+            for member_id in sorted(member_ids)
+        },
+    }
+
+
+def read_coordination(
+    group_dir: Path,
+    meta: dict[str, Any],
+    members_doc: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    path = group_dir / "coordination.json"
+    if path.exists():
+        return read_json(path)
+    members_doc = members_doc or read_json(group_dir / "members.json")
+    # Existing v0.1 groups remain readable as legacy groups. New groups always
+    # create this document explicitly and default to strict coordination.
+    return coordination_document(
+        meta["group_id"],
+        meta.get("coordination_mode", "legacy"),
+        members_doc.get("members", {}),
+    )
+
+
+def scopes_overlap(left: str | None, right: str) -> bool:
+    if left is None:
+        return False
+    return (
+        left == right
+        or left.startswith(right + "/")
+        or right.startswith(left + "/")
+    )
+
+
+def require_fresh_context(
+    group_dir: Path,
+    *,
+    meta: dict[str, Any],
+    member: dict[str, Any],
+    expected_view_version: int | None,
+    requested_scope: str,
+) -> dict[str, Any]:
+    """Fail closed when a strict-group write is based on stale shared state."""
+    current_view = materialize_view(group_dir)
+    if meta.get("coordination_mode", "legacy") != "strict":
+        return current_view
+    if expected_view_version is None:
+        raise BrainError(
+            "CONTEXT_VERSION_REQUIRED",
+            "strict coordination requires --expected-view-version from context",
+        )
+    coordination = read_coordination(group_dir, meta)
+    member_state = coordination.get("members", {}).get(member["member_id"], {})
+    last_context_version = member_state.get("last_context_view_version")
+    if last_context_version is None:
+        raise BrainError(
+            "CONTEXT_NOT_SYNCED",
+            f"{member['member_id']} must call context before publishing",
+        )
+    if not scopes_overlap(member_state.get("last_context_scope"), requested_scope):
+        raise BrainError(
+            "CONTEXT_SCOPE_NOT_SYNCED",
+            f"context scope {member_state.get('last_context_scope')!r} "
+            f"does not cover {requested_scope!r}",
+        )
+    if (
+        expected_view_version != current_view["view_version"]
+        or last_context_version != expected_view_version
+    ):
+        raise BrainError(
+            "CONTEXT_STALE",
+            (
+                f"expected={expected_view_version}; "
+                f"last_context={last_context_version}; "
+                f"current={current_view['view_version']}; reread context"
+            ),
+        )
+    return current_view
 
 
 def read_events(group_dir: Path) -> list[dict[str, Any]]:
@@ -516,6 +646,19 @@ def new_member(
 def command_create(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.root)
     root.mkdir(parents=True, exist_ok=True)
+    if args.coordination_mode not in COORDINATION_MODES:
+        raise BrainError("COORDINATION_MODE_INVALID", args.coordination_mode)
+    if not args.allow_concurrent_groups:
+        existing_group = find_active_identity_membership(
+            root,
+            host_id=args.host_id,
+            thread_id=args.thread_id,
+        )
+        if existing_group is not None:
+            raise BrainError(
+                "THREAD_ALREADY_ACTIVE_IN_OTHER_GROUP",
+                f"{args.host_id}/{args.thread_id} already belongs to {existing_group}",
+            )
     group_dir = group_dir_for(root, args.group_id)
     if group_dir.exists():
         raise BrainError("GROUP_ALREADY_EXISTS", str(group_dir))
@@ -545,6 +688,8 @@ def command_create(args: argparse.Namespace) -> dict[str, Any]:
         "controller_member_id": args.controller_member_id,
         "authority_bundle_sha256": args.authority_bundle_sha256,
         "loopx_goal_id": args.loopx_goal_id,
+        "coordination_mode": args.coordination_mode,
+        "single_active_group_default": not args.allow_concurrent_groups,
         "member_registry_sha256": None,
         "long_term_memory_mounted": False,
         "project_authority_write_enabled": False,
@@ -559,6 +704,14 @@ def command_create(args: argparse.Namespace) -> dict[str, Any]:
         group_dir / "members.json",
         {"schema_version": SCHEMA_VERSION, "members": {controller["member_id"]: controller}},
     )
+    atomic_write_json(
+        group_dir / "coordination.json",
+        coordination_document(
+            args.group_id,
+            args.coordination_mode,
+            [controller["member_id"]],
+        ),
+    )
     sync_member_registry_hash(group_dir)
     (group_dir / "events.jsonl").write_text("", encoding="utf-8")
     with group_lock(group_dir):
@@ -572,6 +725,7 @@ def command_create(args: argparse.Namespace) -> dict[str, Any]:
                 "scope": meta["scope"],
                 "authority_bundle_sha256": args.authority_bundle_sha256,
                 "loopx_goal_id": args.loopx_goal_id,
+                "coordination_mode": args.coordination_mode,
                 "controller": public_member(controller),
             },
         )
@@ -586,6 +740,7 @@ def command_create(args: argparse.Namespace) -> dict[str, Any]:
         "event_id": event["event_id"],
         "view_version": view["view_version"],
         "semantic_hash": view["semantic_hash"],
+        "coordination_mode": args.coordination_mode,
     }
 
 
@@ -605,6 +760,21 @@ def command_add_member(args: argparse.Namespace) -> dict[str, Any]:
         members_doc = read_json(group_dir / "members.json")
         if args.member_id in members_doc["members"]:
             raise BrainError("MEMBER_ALREADY_EXISTS", args.member_id)
+        if (
+            meta.get("coordination_mode", "legacy") == "strict"
+            and not args.allow_concurrent_groups
+        ):
+            existing_group = find_active_identity_membership(
+                Path(args.root),
+                host_id=args.host_id,
+                thread_id=args.thread_id,
+                exclude_group_id=args.group_id,
+            )
+            if existing_group is not None:
+                raise BrainError(
+                    "THREAD_ALREADY_ACTIVE_IN_OTHER_GROUP",
+                    f"{args.host_id}/{args.thread_id} already belongs to {existing_group}",
+                )
         member, token = new_member(
             args.member_id,
             args.role,
@@ -615,6 +785,13 @@ def command_add_member(args: argparse.Namespace) -> dict[str, Any]:
         )
         members_doc["members"][args.member_id] = member
         atomic_write_json(group_dir / "members.json", members_doc)
+        coordination = read_coordination(group_dir, meta, members_doc)
+        coordination["members"][args.member_id] = {
+            "last_context_view_version": None,
+            "last_context_at": None,
+            "last_context_scope": None,
+        }
+        atomic_write_json(group_dir / "coordination.json", coordination)
         meta["state"] = "ACTIVE"
         meta["status"] = "ACTIVE"
         atomic_write_json(group_dir / "group.json", meta)
@@ -683,16 +860,32 @@ def filtered_context(
 
 def command_context(args: argparse.Namespace) -> dict[str, Any]:
     group_dir = group_dir_for(Path(args.root), args.group_id)
-    _, member = authenticate(
-        group_dir,
-        member_id=args.member_id,
-        lease_token=args.lease_token,
-        host_id=args.host_id,
-        thread_id=args.thread_id,
-        requested_scope=args.scope,
-    )
-    view = materialize_view(group_dir)
-    return filtered_context(view, member, args.scope)
+    with group_lock(group_dir):
+        meta, member = authenticate(
+            group_dir,
+            member_id=args.member_id,
+            lease_token=args.lease_token,
+            host_id=args.host_id,
+            thread_id=args.thread_id,
+            requested_scope=args.scope,
+        )
+        view = materialize_view(group_dir)
+        coordination = read_coordination(group_dir, meta)
+        coordination.setdefault("members", {}).setdefault(args.member_id, {})
+        coordination["members"][args.member_id] = {
+            "last_context_view_version": view["view_version"],
+            "last_context_at": now_iso(),
+            "last_context_scope": args.scope,
+        }
+        atomic_write_json(group_dir / "coordination.json", coordination)
+        result = filtered_context(view, member, args.scope)
+    result["coordination"] = {
+        "mode": meta.get("coordination_mode", "legacy"),
+        "context_view_version": view["view_version"],
+        "publish_with_expected_view_version": view["view_version"],
+        "is_fresh": True,
+    }
+    return result
 
 
 def parse_payload(args: argparse.Namespace) -> dict[str, Any]:
@@ -736,6 +929,13 @@ def command_post(args: argparse.Namespace) -> dict[str, Any]:
             )
         if not 0 <= args.confidence <= 1:
             raise BrainError("CONFIDENCE_OUT_OF_RANGE", str(args.confidence))
+        prior_view = require_fresh_context(
+            group_dir,
+            meta=meta,
+            member=member,
+            expected_view_version=args.expected_view_version,
+            requested_scope=args.scope,
+        )
         current_events = read_events(group_dir)
         entry = {
             "entry_id": f"wgbe:{uuid.uuid4().hex}",
@@ -757,6 +957,7 @@ def command_post(args: argparse.Namespace) -> dict[str, Any]:
             "evidence_refs": args.evidence_ref or [],
             "supersedes": args.supersedes_entry_id or [],
             "supersedes_entry_ids": args.supersedes_entry_id or [],
+            "based_on_view_version": prior_view["view_version"],
         }
         event = append_event_locked(
             group_dir,
@@ -771,6 +972,8 @@ def command_post(args: argparse.Namespace) -> dict[str, Any]:
         "entry_type": entry["entry_type"],
         "event_id": event["event_id"],
         "view_version": view["view_version"],
+        "based_on_view_version": prior_view["view_version"],
+        "coordination_state_after_post": "STALE_UNTIL_CONTEXT_REFRESH",
         "semantic_hash": view["semantic_hash"],
     }
 
@@ -788,7 +991,13 @@ def command_resolve(args: argparse.Namespace) -> dict[str, Any]:
         )
         if meta["state"] not in WRITABLE_STATES:
             raise BrainError("GROUP_WRITE_CLOSED", meta["state"])
-        view = materialize_view(group_dir)
+        view = require_fresh_context(
+            group_dir,
+            meta=meta,
+            member=member,
+            expected_view_version=args.expected_view_version,
+            requested_scope=args.scope,
+        )
         target = next(
             (
                 entry
@@ -904,12 +1113,15 @@ def command_freeze(args: argparse.Namespace) -> dict[str, Any]:
         meta["frozen_at"] = now_iso()
         atomic_write_json(group_dir / "group.json", meta)
         frozen_view = materialize_view(group_dir)
+        coordination = read_coordination(group_dir, meta)
         snapshot = {
             "schema_version": SCHEMA_VERSION,
             "snapshot_kind": "frozen_workgroup_context",
             "group_id": args.group_id,
             "frozen_at": meta["frozen_at"],
             "view": frozen_view,
+            "coordination": coordination,
+            "coordination_sha256": semantic_hash(coordination),
         }
         snapshot["snapshot_sha256"] = semantic_hash(
             {key: value for key, value in snapshot.items() if key != "snapshot_sha256"}
@@ -954,6 +1166,7 @@ def command_handoff(args: argparse.Namespace) -> dict[str, Any]:
             "frozen_snapshot_sha256": snapshot["snapshot_sha256"],
             "frozen_view_version": snapshot["view"]["view_version"],
             "frozen_view_semantic_hash": snapshot["view"]["semantic_hash"],
+            "coordination_sha256": snapshot["coordination_sha256"],
             "entry_count": snapshot["view"]["counts"]["entries"],
             "open_question_entry_ids": snapshot["view"]["open_question_entry_ids"],
             "open_conflict_entry_ids": snapshot["view"]["open_conflict_entry_ids"],
@@ -1123,6 +1336,12 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--expires-hours", type=int, default=48)
     create.add_argument("--authority-bundle-sha256", required=True)
     create.add_argument("--loopx-goal-id", required=True)
+    create.add_argument(
+        "--coordination-mode",
+        choices=sorted(COORDINATION_MODES),
+        default="strict",
+    )
+    create.add_argument("--allow-concurrent-groups", action="store_true")
     create.set_defaults(handler=command_create)
 
     add_member = sub.add_parser("add-member")
@@ -1134,6 +1353,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_member.add_argument("--thread-id", required=True)
     add_member.add_argument("--scope", action="append", required=True)
     add_member.add_argument("--lease-hours", type=int, default=24)
+    add_member.add_argument("--allow-concurrent-groups", action="store_true")
     add_member.set_defaults(handler=command_add_member)
 
     context = sub.add_parser("context")
@@ -1154,6 +1374,7 @@ def build_parser() -> argparse.ArgumentParser:
     post.add_argument("--evidence-ref", action="append")
     post.add_argument("--supersedes-entry-id", action="append")
     post.add_argument("--confidence", type=float, default=1.0)
+    post.add_argument("--expected-view-version", type=int)
     post.set_defaults(handler=command_post)
 
     resolve = sub.add_parser("resolve")
@@ -1164,6 +1385,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--status", choices=["resolved", "rejected", "superseded"], required=True
     )
     resolve.add_argument("--resolution", required=True)
+    resolve.add_argument("--scope", required=True)
+    resolve.add_argument("--expected-view-version", type=int)
     resolve.set_defaults(handler=command_resolve)
 
     remove_member = sub.add_parser("remove-member")

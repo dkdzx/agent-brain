@@ -1,0 +1,73 @@
+flowchart LR
+  subgraph A["Codex Tasks and Coordination"]
+    A1["Codex Multi-task"]
+    A2["Trusted Identity<br/>host_id + thread_id<br/>→ role / scope / lease"]
+    A3["LoopX 0.4.1<br/>goal / claim / completion / handoff"]
+    A4["Single Active Workgroup by Default<br/>duplicate host_id + thread_id<br/>fails closed"]
+    A1 --> A2
+    A1 --> A3
+    A2 --> A4
+  end
+
+  subgraph B["Temporary Workgroup Shared State"]
+    B1["workgroup_brain.py<br/>create / context / post / resolve"]
+    B2["members.json<br/>Members, Permissions, Lease Hash"]
+    B3["events.jsonl<br/>Append-only + File Lock + Hash Chain"]
+    B4["Reducer<br/>fsync + os.replace"]
+    B5["view.json<br/>Rebuildable View"]
+    B6["freeze / handoff / close<br/>FROZEN_SNAPSHOT + STABLE_HANDOFF"]
+    B7["coordination.json<br/>last context view_version + scope<br/>per member"]
+    B8{"Publish Version Gate<br/>expected_view_version<br/>equals current?"}
+    B1 --> B2
+    B1 -->|"context at each turn"| B5
+    B5 -->|"acknowledge read version"| B7
+    B1 -->|"post / resolve"| B8
+    B7 --> B8
+    B5 --> B8
+    B8 -->|"fresh: append"| B3
+    B8 -->|"stale: reject and reread"| B5
+    B3 --> B4 --> B5
+    B1 --> B6
+  end
+
+  subgraph C["Long-term Memory"]
+    C1["Session Archive<br/>manifest + source snapshot"]
+    C2["Candidate Extraction<br/>classify + extract"]
+    C3["Temporal Merge<br/>merge + authority manifest"]
+    C4["Long-term Memory Bundle<br/>CORE + Superindices + Supersedes"]
+    C5["query_long_term_memory.py /<br/>verify_long_term_memory_bundle.py"]
+    C6["Graphiti Ingestion<br/>Optional; if unavailable<br/>live writes = 0"]
+    C1 --> C2 --> C3 --> C4 --> C5
+    C4 -.-> C6
+  end
+
+  subgraph D["Authority and Observability"]
+    D1["Project Authority<br/>framework / gate / decision / handoff"]
+    D2["Incomplete Causal Index<br/>CAUSAL_GRAPH + DSM + coverage / gaps"]
+    D3["Controller Review<br/>pending review"]
+    D4["Read-only Workgroup Frontend<br/>ThreadingHTTPServer + sqlite3 title map"]
+    D1 --> D2
+    D3 --> D1
+  end
+
+  A4 --> B1
+  A3 -. "Lifecycle Reconciliation" .-> B6
+  C5 -->|"Frozen Memory Slice"| B1
+  D1 -->|"Authority Hash"| B1
+  D2 -->|"Related Task Causal Slice"| B1
+  B6 -->|"Unreviewed Group-memory Candidates"| D3
+  D3 -->|"Approved Only"| C3
+  B2 -. "Read-only Member Projection" .-> D4
+
+  E1["verify_workgroup_brain.py<br/>Independent Validation"]
+  E2["Wrong Identity, Duplicate Membership,<br/>Stale Context, Overreach, Expired Lease,<br/>and Post-freeze Writes All Fail Closed"]
+  B6 --> E1 --> E2
+
+  classDef work fill:#ddf7ed,stroke:#24856d,color:#111;
+  classDef memory fill:#fff4cc,stroke:#9a7d18,color:#111;
+  classDef authority fill:#e7efff,stroke:#426fae,color:#111;
+  classDef guard fill:#f3e8ff,stroke:#7651a8,color:#111;
+  class B1,B2,B3,B4,B5,B6,B7,B8 work;
+  class C1,C2,C3,C4,C5,C6 memory;
+  class D1,D2,D3,D4 authority;
+  class A1,A2,A3,A4,E1,E2 guard;

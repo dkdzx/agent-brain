@@ -81,6 +81,25 @@ def main() -> int:
 
     meta = read_json(group_dir / "group.json")
     members_doc = read_json(group_dir / "members.json")
+    strict_coordination = meta.get("coordination_mode", "legacy") == "strict"
+    coordination_path = group_dir / "coordination.json"
+    coordination = (
+        read_json(coordination_path)
+        if coordination_path.exists()
+        else {
+            "schema_version": "agent_brain_workgroup_coordination_v1",
+            "group_id": meta["group_id"],
+            "mode": "legacy",
+            "members": {
+                member_id: {
+                    "last_context_view_version": None,
+                    "last_context_at": None,
+                    "last_context_scope": None,
+                }
+                for member_id in sorted(members_doc["members"])
+            },
+        }
+    )
     view = read_json(group_dir / "view.json")
     snapshot = read_json(group_dir / "FROZEN_SNAPSHOT.json")
     handoff = read_json(group_dir / "STABLE_HANDOFF.json")
@@ -221,6 +240,8 @@ def main() -> int:
         "loopx_goal_id",
         "member_registry_sha256",
     }
+    if strict_coordination:
+        required_group_fields.add("coordination_mode")
     check(
         "required_group_fields",
         required_group_fields.issubset(meta),
@@ -252,6 +273,49 @@ def main() -> int:
         if not required_member_fields.issubset(member)
     }
     check("required_member_fields", not missing_member_fields, missing_member_fields)
+    check(
+        "coordination_schema",
+        coordination.get("schema_version") == "agent_brain_workgroup_coordination_v1",
+        coordination.get("schema_version"),
+    )
+    check(
+        "coordination_group_id",
+        coordination.get("group_id") == meta["group_id"],
+        {
+            "expected": meta["group_id"],
+            "actual": coordination.get("group_id"),
+        },
+    )
+    check(
+        "coordination_mode",
+        coordination.get("mode") == meta.get("coordination_mode"),
+        {
+            "meta": meta.get("coordination_mode"),
+            "coordination": coordination.get("mode"),
+        },
+    )
+    check(
+        "coordination_member_universe",
+        set(coordination.get("members", {})) == set(members_doc["members"]),
+        {
+            "expected": sorted(members_doc["members"]),
+            "actual": sorted(coordination.get("members", {})),
+        },
+    )
+    invalid_context_versions = {
+        member_id: member_state.get("last_context_view_version")
+        for member_id, member_state in coordination.get("members", {}).items()
+        if member_state.get("last_context_view_version") is not None
+        and (
+            not isinstance(member_state.get("last_context_view_version"), int)
+            or member_state["last_context_view_version"] > view["view_version"]
+        )
+    }
+    check(
+        "coordination_context_versions_bounded",
+        not invalid_context_versions,
+        invalid_context_versions,
+    )
     required_entry_fields = {
         "group_id",
         "task_id",
@@ -267,12 +331,29 @@ def main() -> int:
         "scope",
         "content_hash",
     }
+    if strict_coordination:
+        required_entry_fields.add("based_on_view_version")
     missing_entry_fields = {
         entry["entry_id"]: sorted(required_entry_fields - set(entry))
         for entry in ordered_entries
         if not required_entry_fields.issubset(entry)
     }
     check("required_entry_fields", not missing_entry_fields, missing_entry_fields)
+    invalid_entry_bases = {
+        entry["entry_id"]: {
+            "based_on_view_version": entry.get("based_on_view_version"),
+            "entry_seq": entry.get("entry_seq"),
+        }
+        for entry in ordered_entries
+        if strict_coordination
+        if not isinstance(entry.get("based_on_view_version"), int)
+        or entry["based_on_view_version"] != entry["entry_seq"] - 1
+    }
+    check(
+        "strict_entries_use_immediately_prior_view",
+        not invalid_entry_bases,
+        invalid_entry_bases,
+    )
     bad_confidence = {
         entry["entry_id"]: entry.get("confidence")
         for entry in ordered_entries
@@ -346,6 +427,32 @@ def main() -> int:
         {
             "handoff": handoff.get("frozen_snapshot_sha256"),
             "snapshot": snapshot.get("snapshot_sha256"),
+        },
+    )
+    check(
+        "snapshot_coordination_pin",
+        (
+            snapshot.get("coordination_sha256")
+            == digest(snapshot.get("coordination", {}))
+            if strict_coordination
+            else True
+        ),
+        {
+            "expected": digest(snapshot.get("coordination", {})),
+            "actual": snapshot.get("coordination_sha256"),
+        },
+    )
+    check(
+        "handoff_coordination_pin",
+        (
+            handoff.get("coordination_sha256")
+            == snapshot.get("coordination_sha256")
+            if strict_coordination
+            else True
+        ),
+        {
+            "handoff": handoff.get("coordination_sha256"),
+            "snapshot": snapshot.get("coordination_sha256"),
         },
     )
     check(
@@ -459,6 +566,7 @@ def main() -> int:
     for file_name, value in {
         "group.json": meta,
         "members.json": members_doc,
+        "coordination.json": coordination,
         "view.json": view,
         "FROZEN_SNAPSHOT.json": snapshot,
         "STABLE_HANDOFF.json": handoff,
