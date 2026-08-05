@@ -6,6 +6,7 @@ __pycache__/
 .agent-brain/
 runtime/
 receipts/
+sandbox/
 *.lease
 *.token
 

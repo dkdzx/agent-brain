@@ -195,8 +195,9 @@ def safe_group_row(
     for member in member_rows:
         role = str(member.get("role") or "unknown")
         active = member_is_active(member)
-        if active:
-            role_counts[role] = role_counts.get(role, 0) + 1
+        if not active:
+            continue
+        role_counts[role] = role_counts.get(role, 0) + 1
         member_id = str(member.get("member_id") or "")
         thread_id = str(member.get("thread_id") or "")
         safe_members.append(
@@ -206,8 +207,8 @@ def safe_group_row(
                 or "未绑定任务",
                 "role": role,
                 "role_label": ROLE_LABELS.get(role, role),
-                "active": active,
-                "status": "活跃" if active else "已退出",
+                "active": True,
+                "status": "活跃",
                 "is_controller": (
                     member_id == controller_member_id or role == "controller"
                 ),
@@ -218,7 +219,6 @@ def safe_group_row(
     safe_members.sort(
         key=lambda row: (
             not row["is_controller"],
-            not row["active"],
             row["role"],
             row["conversation_title"],
         )
@@ -239,10 +239,8 @@ def safe_group_row(
             group.get("state") or group.get("status") or "UNKNOWN"
         ).upper(),
         "active": group_is_active(group),
-        "active_member_count": sum(
-            1 for member in safe_members if member["active"]
-        ),
-        "total_member_count": len(members),
+        "active_member_count": len(safe_members),
+        "total_member_count": len(safe_members),
         "role_counts": role_counts,
         "members": safe_members,
         "created_at": group.get("created_at"),
@@ -449,7 +447,7 @@ def render_html() -> str:
       const initial = (title.trim()[0] || "组").toUpperCase();
       const role = member.is_controller ? `<div class="member-role">总控</div>` : "";
       const memberLabel = member.is_controller ? "工作组总控" : "工作组成员";
-      return `<div class="member ${member.active ? "" : "inactive"}">
+      return `<div class="member">
         <div class="avatar">${escapeHtml(initial)}</div>
         <div>
           <div class="member-title" title="${escapeHtml(title)}">${escapeHtml(title)}</div>

@@ -75,6 +75,19 @@ Run the tests:
 python -m unittest discover -s tests -v
 ```
 
+Run the isolated durable workgroup-memory canary:
+
+```powershell
+python examples/workgroup-memory-v5/task_dispatch_gate.py
+python examples/workgroup-memory-v5/run_v5_canary.py
+python examples/workgroup-memory-v5/external_reader_v5.py
+```
+
+It keeps the raw event chain append-only, rebuilds after a simulated
+interruption, compacts the normal context to an 8 KB budget, extracts
+unreviewed group-memory candidates, and verifies LoopX-style
+goal/todo/claim/group/handoff bindings without writing any production state.
+
 Start the read-only status page:
 
 ```powershell
@@ -85,6 +98,10 @@ python src/agent_brain/workgroup_status_frontend.py `
 ```
 
 Open `http://127.0.0.1:8766/`.
+
+Removed, expired, and revoked members are omitted from the visible workgroup
+member list. Their lifecycle remains reconstructable from the append-only
+event archive.
 
 ## CLI
 
@@ -140,6 +157,7 @@ src/agent_brain/
   graphiti_export.py            optional Graphiti import-request builder
 examples/
   three_agent_demo.py           full synthetic lifecycle
+  workgroup-memory-v5/          durable group-memory and recovery canary
 tests/
 docs/
   overview.md
