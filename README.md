@@ -3,7 +3,7 @@
 A small, project-owned state layer for coordinating coding-agent workgroups
 without treating chat history as durable memory.
 
-![Architecture](assets/architecture.png)
+![Agent memory and workgroup architecture](assets/architecture.png)
 
 ## What it solves
 
