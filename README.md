@@ -106,6 +106,13 @@ Removed, expired, and revoked members are omitted from the visible workgroup
 member list. Their lifecycle remains reconstructable from the append-only
 event archive.
 
+Visible member names are resolved from a stable `thread_id` to the actual
+Codex task title. Internal member IDs and role names remain coordination keys,
+not public names. Initial prompts, delegation markup, source-thread markup,
+and automatic summaries are rejected as display titles. If no verified title
+is available, the status page fails closed with `Task title pending sync`
+instead of guessing a name from chat text.
+
 New workgroups default to `strict` coordination. Every `post` and `resolve`
 must carry the `expected_view_version` returned by that member's most recent
 `context` call. A concurrent member update makes the old context stale and the
@@ -189,6 +196,7 @@ assets/
 - [Short technical overview](docs/overview.md)
 - [Full reproduction guide](docs/reproduction-guide.md)
 - [Security and publication boundary](SECURITY.md)
+- [Temporary workgroup prompt pack](prompts/workgroup-modes.zh-CN.md)
 
 LoopX and Graphiti are optional adapters. The core workgroup and local memory
 ledger remain usable when neither service is installed.

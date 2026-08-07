@@ -31,6 +31,14 @@ ROLE_LABELS = {
     "reviewer": "审查",
     "observer": "观察",
 }
+INVALID_TASK_TITLE_MARKERS = (
+    "<codex_delegation",
+    "<source_thread_id",
+    "<input>",
+    "userMessage",
+    "assistantMessage",
+)
+UNRESOLVED_TASK_TITLE = "任务名称待同步"
 
 
 def now_local() -> datetime:
@@ -80,6 +88,18 @@ def contains_chinese(value: str) -> bool:
     return any("\u4e00" <= char <= "\u9fff" for char in value)
 
 
+def is_valid_codex_task_title(value: Any) -> bool:
+    title = str(value or "").strip()
+    if not title or len(title) > 160 or "\n" in title or "\r" in title:
+        return False
+    lowered = title.lower()
+    if any(marker.lower() in lowered for marker in INVALID_TASK_TITLE_MARKERS):
+        return False
+    if title.startswith("<") or title.endswith(">"):
+        return False
+    return True
+
+
 def group_display_title(group: dict[str, Any], group_id: str) -> str:
     public_name = str(group.get("public_display_name") or "").strip()
     if public_name:
@@ -113,7 +133,7 @@ def load_codex_thread_titles(
                 overrides = {
                     str(thread_id): str(title).strip()
                     for thread_id, title in rows.items()
-                    if str(title).strip()
+                    if is_valid_codex_task_title(title)
                 }
         except (OSError, ValueError, json.JSONDecodeError):
             overrides = {}
@@ -130,7 +150,7 @@ def load_codex_thread_titles(
         rows = connection.execute(
             (
                 "SELECT id, "
-                "COALESCE(NULLIF(TRIM(name), ''), NULLIF(TRIM(title), ''), id) "
+                "COALESCE(NULLIF(TRIM(title), ''), NULLIF(TRIM(name), ''), id) "
                 f"FROM threads WHERE id IN ({placeholders})"
             ),
             wanted,
@@ -143,9 +163,9 @@ def load_codex_thread_titles(
         except (NameError, sqlite3.Error):
             pass
     database_titles = {
-        str(thread_id): str(title)
+        str(thread_id): str(title).strip()
         for thread_id, title in rows
-        if thread_id and title
+        if thread_id and is_valid_codex_task_title(title)
     }
     database_titles.update(
         {
@@ -200,11 +220,25 @@ def safe_group_row(
         role_counts[role] = role_counts.get(role, 0) + 1
         member_id = str(member.get("member_id") or "")
         thread_id = str(member.get("thread_id") or "")
+        member_title = str(member.get("codex_task_title") or "").strip()
+        if not is_valid_codex_task_title(member_title):
+            member_title = ""
+        resolved_title = member_title or title_map.get(thread_id)
+        if not is_valid_codex_task_title(resolved_title):
+            resolved_title = UNRESOLVED_TASK_TITLE
         safe_members.append(
             {
                 "member_id": member_id,
-                "conversation_title": title_map.get(thread_id)
-                or "未绑定任务",
+                "conversation_title": resolved_title,
+                "conversation_title_source": (
+                    "member_verified_codex_task_title"
+                    if member_title
+                    else (
+                        "verified_thread_title_map_or_database"
+                        if resolved_title != UNRESOLVED_TASK_TITLE
+                        else "unresolved_fail_closed"
+                    )
+                ),
                 "role": role,
                 "role_label": ROLE_LABELS.get(role, role),
                 "active": True,
@@ -431,11 +465,11 @@ def render_html() -> str:
       <div class="metric"><span>活跃成员</span><strong id="member-count">—</strong></div>
     </section>
     <section class="group-section">
-      <h2 class="section-title">活动工作组</h2>
+      <h2 class="section-title">运行中的工作组</h2>
       <div id="active-groups"></div>
     </section>
     <section class="group-section">
-      <h2 class="section-title">最近结束的工作组</h2>
+      <h2 class="section-title">已归档的工作组</h2>
       <div id="recent-groups"></div>
     </section>
     <footer id="updated">等待运行态……</footer>
@@ -465,7 +499,7 @@ def render_html() -> str:
         RECONCILED: "已完成待关闭",
         FREEZING: "冻结中"
       };
-      const stateLabel = closed ? "已结束" : (stateLabels[group.state] || "运行中");
+        const stateLabel = closed ? "已归档" : (stateLabels[group.state] || "进行中");
       return `<article class="group">
         <div class="group-head">
           <div>
@@ -492,7 +526,7 @@ def render_html() -> str:
         const recentGroups = data.recent_groups || [];
         document.querySelector("#recent-groups").innerHTML = recentGroups.length
           ? recentGroups.map((group) => groupHtml(group, true)).join("")
-          : `<div class="empty">尚无已结束的工作组。</div>`;
+          : `<div class="empty">暂无已归档的工作组。</div>`;
         document.querySelector("#updated").textContent = `更新于 ${data.generated_at}；仅显示工作组与成员，不显示内部工作内容。`;
       } catch (error) {
         document.querySelector("#connection").textContent = "连接中断";
