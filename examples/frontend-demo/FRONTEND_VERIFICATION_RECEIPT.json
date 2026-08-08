@@ -1,0 +1,46 @@
+{
+  "schema_version": "agent_brain_frontend_demo_receipt_v1",
+  "fixture": "anonymous-workgroup-demo",
+  "url": "http://127.0.0.1:8767/?demo=1",
+  "screenshot": "anonymous-demo-screenshot.png",
+  "verified_at": "2026-08-08T10:30:00+08:00",
+  "checks": {
+    "active_groups": 1,
+    "archived_groups": 1,
+    "active_members": 3,
+    "global_event_stream_count": 180,
+    "current_core_event_count": 4,
+    "real_effect_count": 1,
+    "evidence_count": 4,
+    "bounded_injection_slice_visible": true,
+    "complete_memory_marked_retrieval_only": true,
+    "budget_ladder_visible": [32768, 65536, 131072, 262144, 524288, 1048576],
+    "selected_budget_bytes": 524288,
+    "elbow_budget_bytes": 524288,
+    "next_doubling_marginal_gain": 0.0,
+    "selected_reason": "target_coverage_and_marginal_gain_elbow_reached",
+    "task_pool_pending_visible": true,
+    "task_pool_claimed_visible": true,
+    "one_person_one_task_conflict_count": 0,
+    "exited_member_is_history_only": true,
+    "exact_entry_lookup": true,
+    "all_stream_toggle": true,
+    "non_core_projection_row_visible_after_toggle": true,
+    "empty_active_group_hidden_from_running_index": true,
+    "frontend_tests": "8 passed",
+    "full_test_suite": "15 passed",
+    "py_compile": "passed"
+  },
+  "browser_steps": [
+    "loaded the anonymous demo page",
+    "confirmed core events show local 1/N plus global workgroup sequence",
+    "toggled to all stream and saw the projection row",
+    "opened one exact entry through the read-only endpoint"
+  ],
+  "safety": {
+    "mainline_runtime_modified": false,
+    "protected_backend_files_modified": false,
+    "github_push_performed": false,
+    "real_thread_or_token_exposed": false
+  }
+}

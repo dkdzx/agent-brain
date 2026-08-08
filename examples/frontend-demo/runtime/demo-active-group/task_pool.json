@@ -1,0 +1,8 @@
+{
+  "policy": {"one_person_one_task": true},
+  "items": [
+    {"task_id": "demo-task-pending", "title": "补充异常恢复证据", "status": "READY_UNCLAIMED", "scope": "task/shared"},
+    {"task_id": "demo-task-worker", "title": "整理最小适配实现", "status": "IN_PROGRESS", "claimed_by": "demo-worker", "claimed_at": "2026-08-08T10:05:00+08:00", "scope": "task/shared"},
+    {"task_id": "demo-task-reviewer", "title": "复核关键证据边界", "status": "CLAIMED", "claimed_by": "demo-reviewer", "claimed_at": "2026-08-08T10:05:30+08:00", "scope": "task/shared"}
+  ]
+}

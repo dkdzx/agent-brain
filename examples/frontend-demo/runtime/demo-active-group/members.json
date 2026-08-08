@@ -1,0 +1,68 @@
+{
+  "members": {
+    "demo-controller": {
+      "member_id": "demo-controller",
+      "host_id": "demo-host-controller",
+      "thread_id": "demo-thread-controller",
+      "codex_task_title": "匿名总控任务",
+      "role": "controller",
+      "active": true,
+      "status": "ACTIVE",
+      "scopes": ["task/shared"],
+      "read_scope": ["task/shared"],
+      "write_scope": ["task/shared"],
+      "added_at": "2026-08-08T10:00:00+08:00",
+      "joined_at": "2026-08-08T10:00:10+08:00",
+      "lease_expires_at": "2026-08-09T10:00:00+08:00",
+      "revoked_at": null
+    },
+    "demo-worker": {
+      "member_id": "demo-worker",
+      "host_id": "demo-host-worker",
+      "thread_id": "demo-thread-worker",
+      "codex_task_title": "匿名实现任务",
+      "role": "worker",
+      "active": true,
+      "status": "ACTIVE",
+      "scopes": ["task/shared"],
+      "read_scope": ["task/shared"],
+      "write_scope": ["task/shared"],
+      "added_at": "2026-08-08T10:00:00+08:00",
+      "joined_at": "2026-08-08T10:01:00+08:00",
+      "lease_expires_at": "2026-08-09T10:00:00+08:00",
+      "revoked_at": null
+    },
+    "demo-reviewer": {
+      "member_id": "demo-reviewer",
+      "host_id": "demo-host-reviewer",
+      "thread_id": "demo-thread-reviewer",
+      "codex_task_title": "匿名证据审查任务",
+      "role": "reviewer",
+      "active": true,
+      "status": "ACTIVE",
+      "scopes": ["task/shared"],
+      "read_scope": ["task/shared"],
+      "write_scope": [],
+      "added_at": "2026-08-08T10:00:00+08:00",
+      "joined_at": "2026-08-08T10:01:10+08:00",
+      "lease_expires_at": "2026-08-09T10:00:00+08:00",
+      "revoked_at": null
+    },
+    "demo-exited": {
+      "member_id": "demo-exited",
+      "host_id": "demo-host-exited",
+      "thread_id": "demo-thread-exited",
+      "codex_task_title": "已退出匿名诊断任务",
+      "role": "reviewer",
+      "active": false,
+      "status": "COMPLETED_SLOT_RELEASED",
+      "scopes": ["task/shared"],
+      "read_scope": ["task/shared"],
+      "write_scope": [],
+      "added_at": "2026-08-08T10:00:00+08:00",
+      "joined_at": "2026-08-08T10:01:20+08:00",
+      "lease_expires_at": "2026-08-08T10:03:00+08:00",
+      "revoked_at": "2026-08-08T10:04:00+08:00"
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "members": {
+    "demo-archived-reviewer": {
+      "member_id": "demo-archived-reviewer",
+      "codex_task_title": "匿名历史审查任务",
+      "role": "reviewer",
+      "active": false,
+      "status": "COMPLETED_SLOT_RELEASED",
+      "read_scope": ["task/shared"],
+      "write_scope": []
+    }
+  }
+}

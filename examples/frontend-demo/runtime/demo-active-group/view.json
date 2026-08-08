@@ -1,0 +1,160 @@
+{
+  "schema_version": "agent_brain_workgroup_runtime_v1",
+  "group_id": "demo-active-group",
+  "task_id": "demo-task",
+  "objective": "比较两个匿名方案并确认可复核的最小交付",
+  "state": "ACTIVE",
+  "status": "ACTIVE",
+  "scope": ["task/shared"],
+  "authority_bundle_sha256": "anonymous-authority",
+  "loopx_goal_id": "anonymous-goal",
+  "member_registry_sha256": "anonymous-members",
+  "semantic_hash": "anonymous-view",
+  "view_version": 8,
+  "event_chain_head": "anonymous-head",
+  "frontend_context_projection": {
+    "source": "anonymous_backend_curve_projection",
+    "selected_budget_bytes": 524288,
+    "selected_reason": "target_coverage_and_marginal_gain_elbow_reached",
+    "elbow_budget_bytes": 524288,
+    "doubling_marginal_gain": 0.0,
+    "budget_curve": [
+      {"budget_bytes": 32768, "coverage_ratio": 0.486},
+      {"budget_bytes": 65536, "coverage_ratio": 0.685},
+      {"budget_bytes": 131072, "coverage_ratio": 0.763},
+      {"budget_bytes": 262144, "coverage_ratio": 0.955},
+      {"budget_bytes": 524288, "coverage_ratio": 1.0, "elbow": true},
+      {"budget_bytes": 1048576, "coverage_ratio": 1.0, "marginal_gain_from_previous": 0.0}
+    ]
+  },
+  "context_policy": {
+    "mode": "adaptive",
+    "budget_bytes": 1048576,
+    "selected_budget_bytes": 524288,
+    "minimum_budget_bytes": 32768,
+    "budget_ladder_bytes": [32768, 65536, 131072, 262144, 524288, 1048576],
+    "target_coverage": 0.95,
+    "minimum_marginal_gain": 0.03,
+    "max_entries": 512,
+    "member_position_card_limit": 15,
+    "benefit_curve": [
+      {"budget_bytes": 32768, "coverage_ratio": 0.486, "elbow": false},
+      {"budget_bytes": 65536, "coverage_ratio": 0.685, "elbow": false},
+      {"budget_bytes": 131072, "coverage_ratio": 0.763, "elbow": false},
+      {"budget_bytes": 262144, "coverage_ratio": 0.955, "elbow": false},
+      {"budget_bytes": 524288, "coverage_ratio": 1.0, "elbow": true, "doubling_marginal_gain": 0.0},
+      {"budget_bytes": 1048576, "coverage_ratio": 1.0, "elbow": false, "doubling_marginal_gain": 0.0}
+    ],
+    "selected_reason": "target_coverage_and_marginal_gain_elbow_reached",
+    "elbow_budget_bytes": 524288,
+    "doubling_marginal_gain": 0.0,
+    "member_opinion_coverage": 1.0,
+    "decision_conflict_coverage": 0.83,
+    "duplicate_rate": 0.08,
+    "retrieval_supplement_count": 2,
+    "latency_ms": 42
+  },
+  "open_question_entry_ids": ["demo-entry-question"],
+  "open_conflict_entry_ids": ["demo-entry-conflict"],
+  "current_best_model_entry_ids": ["demo-entry-decision"],
+  "counts": {"events": 180, "entries": 5, "active_members": 3, "open_questions": 1, "open_conflicts": 1},
+  "entries": [
+    {
+      "entry_id": "demo-entry-projection",
+      "entry_seq": 176,
+      "entry_type": "PROJECTION_UPDATED",
+      "subject_key": "demo.projection",
+      "scope": "task/shared",
+      "status": "active",
+      "confidence": 1.0,
+      "author_member_id": "demo-controller",
+      "created_at": "2026-08-08T10:00:30+08:00",
+      "content": {"text": "只读投影已刷新；该流水不代表新的任务裁决。"},
+      "evidence_refs": []
+    },
+    {
+      "entry_id": "demo-entry-claim",
+      "entry_seq": 177,
+      "entry_type": "FACT_CONFIRMED",
+      "subject_key": "demo.contract",
+      "scope": "task/shared",
+      "status": "active",
+      "confidence": 0.92,
+      "author_member_id": "demo-worker",
+      "created_at": "2026-08-08T10:01:00+08:00",
+      "content": {
+        "core_claim": "方案 A 可以在不改变外部接口的前提下完成最小适配。",
+        "strongest_evidence": "匿名回归样例覆盖了输入、转换和输出三个边界。",
+        "strongest_counterevidence": "尚未验证高并发下的重复提交。",
+        "claim_ceiling": "只能声称最小适配可行，不能声称生产级并发安全。",
+        "evidence_status": "diagnostic_valid",
+        "model_gate_status": "valid",
+        "signing_authority": "none"
+      },
+      "evidence_refs": ["evidence/demo-contract.json"]
+    },
+    {
+      "entry_id": "demo-entry-conflict",
+      "entry_seq": 178,
+      "entry_type": "CONFLICT_RECORDED",
+      "subject_key": "demo.choice",
+      "scope": "task/shared",
+      "status": "active",
+      "confidence": 0.8,
+      "author_member_id": "demo-reviewer",
+      "created_at": "2026-08-08T10:02:00+08:00",
+      "content": {
+        "core_claim": "方案 A 的证据还不足以支持直接进入主线。",
+        "strongest_evidence": "压力样例尚未覆盖异常恢复路径。",
+        "strongest_counterevidence": "当前任务只要求验证接口适配，不要求生产压力证明。",
+        "claim_ceiling": "可以阻止过度晋升，但不能否定最小适配本身。",
+        "evidence_status": "diagnostic_valid",
+        "model_gate_status": "noncompliant",
+        "signing_authority": "none"
+      },
+      "evidence_refs": ["evidence/demo-review.json"]
+    },
+    {
+      "entry_id": "demo-entry-decision",
+      "entry_seq": 179,
+      "entry_type": "LOCAL_DECISION",
+      "subject_key": "demo.choice",
+      "scope": "task/shared",
+      "status": "active",
+      "confidence": 0.88,
+      "author_member_id": "demo-controller",
+      "created_at": "2026-08-08T10:03:00+08:00",
+      "content": {
+        "core_claim": "保留方案 A 作为候选实现，先补异常恢复证据。",
+        "strongest_evidence": "当前接口回归证据已通过独立复核。",
+        "strongest_counterevidence": "异常恢复仍然是开放问题。",
+        "claim_ceiling": "允许进入候选交接，不允许直接声明项目完成。",
+        "evidence_status": "verified",
+        "model_gate_status": "valid",
+        "signing_authority": "none"
+      },
+      "evidence_refs": ["evidence/demo-decision.json"]
+    },
+    {
+      "entry_id": "demo-entry-question",
+      "entry_seq": 180,
+      "entry_type": "QUESTION_OPENED",
+      "subject_key": "demo.recovery",
+      "scope": "task/shared",
+      "status": "active",
+      "confidence": 0.7,
+      "author_member_id": "demo-exited",
+      "created_at": "2026-08-08T10:04:00+08:00",
+      "content": {
+        "core_claim": "异常恢复条件尚未被正式回答。",
+        "strongest_evidence": "历史诊断记录只覆盖了正常路径。",
+        "strongest_counterevidence": "本轮可以通过独立 fixture 补充恢复样例。",
+        "claim_ceiling": "只能作为历史诊断问题，不能代表当前正式成员结论。",
+        "evidence_status": "diagnostic_valid",
+        "model_gate_status": "valid",
+        "signing_authority": "none"
+      },
+      "evidence_refs": ["evidence/demo-recovery-question.json"]
+    }
+  ]
+}
