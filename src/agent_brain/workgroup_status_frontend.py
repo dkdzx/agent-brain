@@ -33,6 +33,7 @@ DEFAULT_CODEX_STATE_DB = Path.home() / ".codex" / "state_5.sqlite"
 DEFAULT_TITLE_MAP = DEFAULT_RUNTIME_ROOT / "CODEX_THREAD_TITLE_MAP.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8766
+DEFAULT_CONSTRUCTION_DEMO_URL = "http://127.0.0.1:8766/?demo=1"
 TERMINAL_GROUP_STATES = {
     "ARCHIVED",
     "CLOSED",
@@ -61,6 +62,9 @@ EXACT_ENTRY_SCHEMA_VERSION = "agent_brain_workgroup_frontend_exact_entry_v1"
 NO_FINAL_SIGNING_AUTHORITY = "无最终签字权"
 DIAGNOSTIC_EVIDENCE_VALID = "诊断证据有效"
 MODEL_GATE_NONCOMPLIANT = "模型门不合规"
+STRUCTURAL_ISSUE_SCHEMA_VERSION = "agent_brain_structural_issue_v1"
+STRUCTURAL_ISSUE_STATUSES = {"active", "resolved", "superseded"}
+STRUCTURAL_ISSUE_SEVERITIES = {"critical", "high", "medium", "low"}
 
 
 def now_local() -> datetime:
@@ -97,9 +101,23 @@ def group_is_active(group: dict[str, Any]) -> bool:
 
 
 def member_is_active(member: dict[str, Any]) -> bool:
-    if member.get("active") is not True:
-        return False
     state = str(member.get("status") or "").upper()
+    explicit_active = member.get("active")
+    if explicit_active is not True:
+        if explicit_active is False:
+            return False
+        active_markers = {
+            "ACTIVE",
+            "IN_PROGRESS",
+            "ACTIVE_INPROGRESS",
+            "DISPATCHED_ACTIVE",
+            "CLAIMED",
+        }
+        if not (
+            member.get("active_group_slot") is True
+            or state in active_markers
+        ):
+            return False
     if state in REVOKED_MEMBER_STATES or member.get("revoked_at"):
         return False
     expires_at = parse_datetime(member.get("lease_expires_at"))
@@ -642,6 +660,122 @@ def task_pool_source(
                 return sidecar[key]
         return sidecar
     return None
+
+
+def normalize_structural_issue(issue: dict[str, Any]) -> dict[str, Any] | None:
+    issue_id = str(issue.get("issue_id") or issue.get("id") or "").strip()
+    title = str(issue.get("title") or "").strip()
+    if not issue_id or not title:
+        return None
+    raw_status = str(issue.get("status") or "active").strip().lower()
+    status = raw_status if raw_status in STRUCTURAL_ISSUE_STATUSES else "active"
+    raw_severity = str(issue.get("severity") or "medium").strip().lower()
+    severity = raw_severity if raw_severity in STRUCTURAL_ISSUE_SEVERITIES else "medium"
+
+    def safe_list(value: Any) -> list[str]:
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if value in (None, ""):
+            return []
+        return [str(value).strip()]
+
+    return {
+        "issue_id": issue_id,
+        "title": title,
+        "category": str(issue.get("category") or "未分类").strip(),
+        "severity": severity,
+        "status": status,
+        "discovered_at": issue.get("discovered_at"),
+        "affected_goal_or_path": str(issue.get("affected_goal_or_path") or "").strip(),
+        "evidence_refs": safe_list(issue.get("evidence_refs")),
+        "impact": str(issue.get("impact") or "").strip(),
+        "current_ruling": str(issue.get("current_ruling") or "").strip(),
+        "allowed_route": str(issue.get("allowed_route") or "").strip(),
+        "forbidden_interpretation": str(issue.get("forbidden_interpretation") or "").strip(),
+        "owner_task_id": str(issue.get("owner_task_id") or "").strip() or None,
+        "owner_task_name": str(issue.get("owner_task_name") or "").strip() or None,
+        "supersedes": safe_list(issue.get("supersedes")),
+        "resolution_refs": safe_list(issue.get("resolution_refs")),
+    }
+
+
+def load_structural_issues(group_dir: Path) -> list[dict[str, Any]]:
+    by_id: dict[str, dict[str, Any]] = {}
+    payload = load_optional_json(group_dir / "structural_issues.json")
+    if payload is not None:
+        raw_issues = payload.get("issues")
+        if not isinstance(raw_issues, list):
+            raw_issues = [payload] if payload.get("issue_id") or payload.get("id") else []
+        for item in raw_issues:
+            if not isinstance(item, dict):
+                continue
+            normalized = normalize_structural_issue(item)
+            if normalized is not None:
+                by_id[normalized["issue_id"]] = normalized
+
+    append_only_path = group_dir / "structural_issues.jsonl"
+    if append_only_path.is_file():
+        try:
+            with append_only_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(record, dict):
+                        continue
+                    candidate = record.get("issue")
+                    if not isinstance(candidate, dict):
+                        candidate = record
+                    normalized = normalize_structural_issue(candidate)
+                    if normalized is not None:
+                        by_id[normalized["issue_id"]] = normalized
+        except OSError:
+            pass
+
+    issues = list(by_id.values())
+    return sorted(
+        issues,
+        key=lambda item: (
+            item["status"] != "active",
+            item.get("discovered_at") or "",
+            item["issue_id"],
+        ),
+    )
+
+
+def structural_issues_projection(
+    runtime_root: Path,
+    group_id: str,
+    *,
+    status: str | None = None,
+    severity: str | None = None,
+) -> dict[str, Any] | None:
+    group_dir = runtime_root / group_id
+    if not group_dir.is_dir() or load_optional_json(group_dir / "group.json") is None:
+        return None
+    issues = load_structural_issues(group_dir)
+    normalized_status = str(status or "").strip().lower()
+    normalized_severity = str(severity or "").strip().lower()
+    if normalized_status in STRUCTURAL_ISSUE_STATUSES:
+        issues = [item for item in issues if item["status"] == normalized_status]
+    if normalized_severity in STRUCTURAL_ISSUE_SEVERITIES:
+        issues = [item for item in issues if item["severity"] == normalized_severity]
+    return {
+        "schema_version": STRUCTURAL_ISSUE_SCHEMA_VERSION,
+        "group_id": group_id,
+        "read_only": True,
+        "source": "structural_issues.json",
+        "available": (group_dir / "structural_issues.json").is_file(),
+        "issues": issues,
+        "counts": {
+            "all": len(load_structural_issues(group_dir)),
+            "active": sum(item["status"] == "active" for item in load_structural_issues(group_dir)),
+            "visible": len(issues),
+        },
+    }
 
 
 def normalize_task_pool(
@@ -1724,7 +1858,7 @@ def load_group_view(group_dir: Path) -> dict[str, Any] | None:
     if callable(materialize_view):
         try:
             return materialize_view(group_dir)
-        except (OSError, KeyError, ValueError, json.JSONDecodeError):
+        except Exception:
             return None
     return None
 
@@ -1780,6 +1914,15 @@ def group_detail_projection(
         member_titles,
     )
     task_pool = normalize_task_pool(group_dir, group, member_titles)
+    structural_issues = structural_issues_projection(runtime_root, group_id) or {
+        "schema_version": STRUCTURAL_ISSUE_SCHEMA_VERSION,
+        "group_id": group_id,
+        "read_only": True,
+        "source": "structural_issues.json",
+        "available": False,
+        "issues": [],
+        "counts": {"all": 0, "active": 0, "visible": 0},
+    }
     inactive_member_count = sum(
         1 for member in context_members if not member_is_active(member)
     )
@@ -1793,10 +1936,12 @@ def group_detail_projection(
         "historical_member_count": inactive_member_count,
         "context": context,
         "task_pool": task_pool,
+        "structural_issues": structural_issues,
         "source": {
             "view": "view.json" if (group_dir / "view.json").is_file() else "materialized read-only view",
             "event_archive": "events.jsonl",
             "task_pool": task_pool.get("source"),
+            "structural_issues": structural_issues.get("source"),
             "exact_entry": "get-entry-compatible read-only projection",
         },
         "privacy": {
@@ -2144,6 +2289,20 @@ def render_html() -> str:
     .section { margin-top: 17px; padding: 16px; border: 1px solid var(--line-soft); border-radius: 15px; background: rgba(13, 27, 46, .78); box-shadow: var(--shadow); }
     .section-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; font-size: 15px; }
     .section-title small { color: var(--muted); font-size: 11px; font-weight: 500; }
+    .module-picker { position: sticky; top: 0; z-index: 3; background: rgba(13, 27, 46, .96); }
+    .module-picker-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .module-picker-head small { color: var(--muted); font-size: 11px; }
+    .module-options { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 11px; }
+    .module-option { display: inline-flex; align-items: center; gap: 6px; padding: 6px 9px; color: #cfe0ff; border: 1px solid rgba(120, 170, 255, .28); border-radius: 999px; background: rgba(42, 79, 134, .28); cursor: pointer; font-size: 11px; user-select: none; }
+    .module-option:hover { border-color: var(--blue); background: rgba(56, 105, 181, .45); }
+    .module-option input { accent-color: var(--blue); margin: 0; }
+    .module-section { min-width: 0; }
+    .module-scroll { max-height: 300px; overflow: auto; padding-right: 5px; scrollbar-color: #557eb9 rgba(7, 17, 31, .55); scrollbar-width: thin; scrollbar-gutter: stable; }
+    .module-scroll.tall { max-height: 340px; }
+    .module-scroll.compact { max-height: 220px; }
+    .module-scroll::-webkit-scrollbar, .scroll-box::-webkit-scrollbar, .exact-panel pre::-webkit-scrollbar { width: 9px; height: 9px; }
+    .module-scroll::-webkit-scrollbar-track, .scroll-box::-webkit-scrollbar-track, .exact-panel pre::-webkit-scrollbar-track { background: rgba(7, 17, 31, .55); border-radius: 999px; }
+    .module-scroll::-webkit-scrollbar-thumb, .scroll-box::-webkit-scrollbar-thumb, .exact-panel pre::-webkit-scrollbar-thumb { background: #557eb9; border: 2px solid rgba(7, 17, 31, .55); border-radius: 999px; }
     .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; }
     .metric { min-width: 0; padding: 11px 12px; border: 1px solid var(--line-soft); border-radius: 11px; background: rgba(7, 17, 31, .5); }
     .metric-label { color: var(--muted); font-size: 11px; line-height: 1.35; }
@@ -2164,9 +2323,24 @@ def render_html() -> str:
     .notice { margin-top: 12px; padding: 9px 11px; color: #cadbfa; border-left: 3px solid var(--blue); background: rgba(55, 97, 162, .2); font-size: 12px; line-height: 1.55; }
     .notice.warn { color: #ffe9bd; border-left-color: var(--amber); background: rgba(127, 89, 21, .22); }
     .two-col { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-    .scroll-box { max-height: 330px; overflow: auto; padding-right: 4px; }
+    .scroll-box { max-height: 240px; overflow: auto; padding-right: 4px; scrollbar-gutter: stable; }
     .task-card, .entry-card, .member-card { padding: 12px; border: 1px solid var(--line-soft); border-radius: 11px; background: rgba(16, 31, 53, .7); }
     .task-card + .task-card, .entry-card + .entry-card, .member-card + .member-card { margin-top: 8px; }
+    .issue-card { padding: 13px; border: 1px solid rgba(243, 195, 109, .42); border-radius: 11px; background: rgba(55, 43, 20, .34); }
+    .issue-card.active { border-color: rgba(255, 127, 135, .58); background: rgba(88, 35, 43, .22); }
+    .issue-card.resolved { border-color: rgba(75, 224, 163, .38); background: rgba(20, 78, 61, .22); }
+    .issue-card + .issue-card { margin-top: 9px; }
+    .issue-summary { cursor: pointer; list-style: none; }
+    .issue-summary::-webkit-details-marker { display: none; }
+    .issue-summary::before { content: "▸"; display: inline-block; width: 18px; color: var(--amber); transition: transform .16s; }
+    .issue-card[open] .issue-summary::before { transform: rotate(90deg); }
+    .issue-title { display: inline; color: var(--text); font-size: 13px; font-weight: 850; line-height: 1.5; }
+    .issue-meta { margin-top: 7px; color: var(--muted); font-size: 11px; line-height: 1.55; }
+    .issue-body { margin: 11px 0 0 18px; }
+    .issue-field { margin-top: 7px; color: var(--muted); font-size: 11px; line-height: 1.6; }
+    .issue-field strong { color: #dbe8ff; }
+    .issue-filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 11px; }
+    .issue-filter { padding: 6px 8px; color: #cfe0ff; border: 1px solid rgba(120, 170, 255, .28); border-radius: 7px; background: rgba(7, 17, 31, .48); font-size: 11px; }
     .task-top, .entry-top, .member-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
     .mono { color: #a6c8ff; font: 11px/1.4 Consolas, "SFMono-Regular", monospace; word-break: break-word; }
     .task-title, .entry-title, .member-title { margin-top: 4px; color: var(--text); font-size: 13px; font-weight: 800; line-height: 1.5; }
@@ -2182,6 +2356,14 @@ def render_html() -> str:
     .member-card { min-width: 0; }
     .member-card.history { opacity: .82; border-color: rgba(243, 195, 109, .32); }
     .member-card .claim { margin-top: 10px; color: #dbe8ff; font-size: 12px; line-height: 1.55; }
+    .position-timeline { display: grid; gap: 7px; margin: 11px 0 2px; padding: 9px 10px 9px 13px; border-left: 2px solid rgba(120, 170, 255, .42); background: rgba(7, 17, 31, .28); }
+    .timeline-step { position: relative; padding-left: 10px; color: var(--muted); font-size: 10px; line-height: 1.45; }
+    .timeline-step::before { content: ""; position: absolute; left: -17px; top: 4px; width: 7px; height: 7px; border: 2px solid var(--blue); border-radius: 50%; background: var(--panel); }
+    .timeline-step.current { color: var(--text); }
+    .timeline-step.current::before { border-color: var(--green); background: var(--green); box-shadow: 0 0 9px rgba(75,224,163,.6); }
+    .timeline-step .timeline-label { color: #cfe0ff; font-weight: 800; }
+    .timeline-step .timeline-source { color: var(--faint); font-family: Consolas, "SFMono-Regular", monospace; }
+    .timeline-empty { color: var(--faint); font-size: 10px; }
     .label { color: var(--faint); }
     .ref-list { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
     .ref { padding: 3px 6px; color: #b8d1ff; border: 1px solid rgba(120,170,255,.2); border-radius: 6px; font: 10px Consolas, monospace; }
@@ -2192,7 +2374,7 @@ def render_html() -> str:
     .footer { padding: 10px 24px 14px; color: var(--faint); border-top: 1px solid var(--line-soft); font-size: 11px; }
     .loading { padding: 44px 18px; color: var(--muted); text-align: center; }
     @media (max-width: 1060px) { .layout { grid-template-columns: 270px minmax(0, 1fr); } .member-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-    @media (max-width: 760px) { .layout { display: block; } .sidebar { max-height: 38vh; border-right: 0; border-bottom: 1px solid var(--line-soft); } .detail { max-height: none; } .context-grid, .two-col { grid-template-columns: 1fr; } .member-grid { grid-template-columns: 1fr; } .topbar { align-items: flex-start; flex-direction: column; } }
+    @media (max-width: 760px) { .layout { display: block; } .sidebar { max-height: 38vh; border-right: 0; border-bottom: 1px solid var(--line-soft); } .detail { max-height: none; } .context-grid, .two-col { grid-template-columns: 1fr; } .member-grid { grid-template-columns: 1fr; } .topbar { align-items: flex-start; flex-direction: column; } .module-picker { position: static; } .module-scroll, .module-scroll.tall { max-height: 330px; } }
   </style>
 </head>
 <body>
@@ -2221,6 +2403,30 @@ def render_html() -> str:
     let detailRequestSerial = 0;
     let currentDetail = null;
     let showAllEvents = false;
+    const moduleVisibility = {
+      summary: true,
+      context: true,
+      task_pool: true,
+      structural_issues: true,
+      position_cards: true,
+      members: true,
+      events: true,
+      history: true,
+      boundary: true,
+    };
+    const moduleDefinitions = [
+      ['summary', '运行摘要'],
+      ['context', '当前注入切片'],
+      ['task_pool', '任务池'],
+      ['structural_issues', '重大结构性问题'],
+      ['position_cards', '成员观点卡'],
+      ['members', '工作组成员'],
+      ['events', '当前核心事件'],
+      ['history', '历史诊断证据'],
+      ['boundary', '来源与边界'],
+    ];
+    const issueFilter = {status: 'active', severity: 'all'};
+    const structuralIssuesApiPath = '/api/structural-issues';
     const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
     const text = (value, fallback = '—') => value === null || value === undefined || value === '' ? fallback : String(value);
     const apiUrl = (path, params = {}) => {
@@ -2270,6 +2476,15 @@ def render_html() -> str:
       root.innerHTML = `<div class="list-label">运行中的工作组 · ${active.length}</div>${active.length ? active.map((item) => renderGroupCard(item, false)).join('') : '<div class="empty">当前没有运行中的工作组。</div>'}
         <div class="list-label">已归档的工作组 · ${archived.length}</div>${archived.length ? archived.map((item) => renderGroupCard(item, true)).join('') : '<div class="empty">暂无已归档的工作组。</div>'}`;
     }
+    const moduleEnabled = (id) => moduleVisibility[id] !== false;
+    const renderModulePicker = () => `<section class="section module-picker">
+      <div class="module-picker-head"><span>显示模块</span><small>只影响当前页面，不改变工作组数据</small></div>
+      <div class="module-options">${moduleDefinitions.map(([id, label]) => `<label class="module-option"><input type="checkbox" data-module-toggle="${id}" ${moduleEnabled(id) ? 'checked' : ''}><span>${escapeHtml(label)}</span></label>`).join('')}</div>
+    </section>`;
+    const moduleSection = (id, title, meta, body, scrollClass = '') => moduleEnabled(id) ? `<section class="section module-section" data-module="${id}">
+      <div class="section-title"><span>${escapeHtml(title)}</span>${meta ? `<small>${escapeHtml(meta)}</small>` : ''}</div>
+      <div class="module-scroll ${scrollClass}">${body}</div>
+    </section>` : '';
     const metric = (label, value, note = '') => `<div class="metric"><div class="metric-label">${escapeHtml(label)}</div><div class="metric-value">${escapeHtml(text(value))}</div>${note ? `<div class="metric-note">${escapeHtml(note)}</div>` : ''}</div>`;
     const refs = (values) => {
       const list = Array.isArray(values) ? values : [];
@@ -2327,17 +2542,48 @@ def render_html() -> str:
       const waiting = pool.waiting || [];
       const claimed = pool.claimed || [];
       const conflict = Number(pool.conflict_count || 0);
-      return `<section class="section"><div class="section-title"><span>任务池</span><small>只读投影 · ${escapeHtml(text(pool.policy_label, '一人一任务'))}</small></div>
-        <div class="metric-grid">${metric('待领取', pool.waiting_count)}${metric('已领取', pool.claimed_count)}${metric('一人一任务', pool.one_person_one_task ? '启用' : '未声明')}${metric('冲突', conflict, conflict ? '需要上游处理' : '当前未发现')}</div>
+      const body = `<div class="metric-grid">${metric('待领取', pool.waiting_count)}${metric('已领取', pool.claimed_count)}${metric('一人一任务', pool.one_person_one_task ? '启用' : '未声明')}${metric('冲突', conflict, conflict ? '需要上游处理' : '当前未发现')}</div>
         ${conflict ? `<div class="notice warn">${escapeHtml(JSON.stringify(pool.member_conflicts || pool.task_conflicts))}</div>` : ''}
-        <div class="two-col" style="margin-top:12px"><div><h3 class="section-title">待领取 <small>${waiting.length} 项</small></h3><div class="scroll-box">${waiting.length ? waiting.map((item) => renderTask(item, false)).join('') : '<div class="empty">暂无待领取任务。</div>'}</div></div><div><h3 class="section-title">已领取 · 任务 ↔ Codex 任务 <small>${claimed.length} 项</small></h3><div class="scroll-box">${claimed.length ? claimed.map((item) => renderTask(item, true)).join('') : '<div class="empty">暂无已领取任务。</div>'}</div></div></div>
-      </section>`;
+        <div class="two-col" style="margin-top:12px"><div><h3 class="section-title">待领取 <small>${waiting.length} 项</small></h3><div class="scroll-box">${waiting.length ? waiting.map((item) => renderTask(item, false)).join('') : '<div class="empty">暂无待领取任务。</div>'}</div></div><div><h3 class="section-title">已领取 · 任务 ↔ Codex 任务 <small>${claimed.length} 项</small></h3><div class="scroll-box">${claimed.length ? claimed.map((item) => renderTask(item, true)).join('') : '<div class="empty">暂无已领取任务。</div>'}</div></div></div>`;
+      return moduleSection('task_pool', '任务池', `只读投影 · ${text(pool.policy_label, '一人一任务')}`, body, 'tall');
+    };
+    const issueStatusLabel = (value) => ({active: '进行中', resolved: '已解决', superseded: '已被替代'}[value] || text(value, '未知状态'));
+    const issueSeverityLabel = (value) => ({critical: '致命', high: '高', medium: '中', low: '低'}[value] || text(value, '未分级'));
+    const renderStructuralIssues = (payload) => {
+      if (!moduleEnabled('structural_issues')) return '';
+      const allIssues = Array.isArray(payload?.issues) ? payload.issues : [];
+      const visible = allIssues.filter((issue) => (issueFilter.status === 'all' || issue.status === issueFilter.status) && (issueFilter.severity === 'all' || issue.severity === issueFilter.severity));
+      const statusOptions = ['active', 'resolved', 'superseded'];
+      const severityOptions = ['all', 'critical', 'high', 'medium', 'low'];
+      const cards = visible.length ? visible.map((issue) => `<details class="issue-card ${escapeHtml(text(issue.status))}" ${issue.status === 'active' ? 'open' : ''}>
+        <summary class="issue-summary"><span class="issue-title">${escapeHtml(text(issue.title, '未命名结构性问题'))}</span> ${badge(issueSeverityLabel(issue.severity))} ${badge(issueStatusLabel(issue.status))}</summary>
+        <div class="issue-meta">${escapeHtml(text(issue.issue_id))} · ${escapeHtml(text(issue.category, '未分类'))} · 发现时间：${escapeHtml(text(issue.discovered_at))}</div>
+        <div class="issue-body"><div class="issue-field"><strong>影响目标/路径：</strong>${escapeHtml(text(issue.affected_goal_or_path, '未提供'))}</div><div class="issue-field"><strong>影响：</strong>${escapeHtml(text(issue.impact, '未提供'))}</div><div class="issue-field"><strong>当前裁定：</strong>${escapeHtml(text(issue.current_ruling, '未提供'))}</div><div class="issue-field"><strong>允许路线：</strong>${escapeHtml(text(issue.allowed_route, '未提供'))}</div><div class="issue-field"><strong>禁止误读：</strong>${escapeHtml(text(issue.forbidden_interpretation, '未提供'))}</div><div class="issue-field"><strong>负责人：</strong>${escapeHtml(text(issue.owner_task_name || issue.owner_task_id, '未指定'))}</div>${refs(issue.evidence_refs)}${issue.resolution_refs?.length ? `<div class="issue-field"><strong>解决引用：</strong>${refs(issue.resolution_refs)}</div>` : ''}</div>
+      </details>`).join('') : '<div class="empty">当前筛选没有结构性问题。</div>';
+      const body = `<div class="issue-filters"><label>状态 <select aria-label="状态筛选" class="issue-filter" data-issue-filter="status">${['all', ...statusOptions].map((value) => `<option value="${value}" ${issueFilter.status === value ? 'selected' : ''}>${value === 'all' ? '全部状态' : issueStatusLabel(value)}</option>`).join('')}</select></label><label>严重度 <select aria-label="严重度筛选" class="issue-filter" data-issue-filter="severity">${severityOptions.map((value) => `<option value="${value}" ${issueFilter.severity === value ? 'selected' : ''}>${value === 'all' ? '全部严重度' : issueSeverityLabel(value)}</option>`).join('')}</select></label><span class="tag amber">显示 ${visible.length}/${allIssues.length}</span></div><div>${cards}</div>`;
+      return moduleSection('structural_issues', '重大结构性问题', `默认 active · ${payload?.read_only ? '只读投影' : '来源未声明'} · ${structuralIssuesApiPath}`, body, 'tall');
     };
     const renderMember = (member) => `<article class="member-card"><div class="member-top"><div><div class="member-title">${escapeHtml(text(member.conversation_title, '任务名称待同步'))}</div><div class="member-detail">${escapeHtml(text(member.role))} · ${escapeHtml(text(member.status))}</div></div>${badge(member.is_controller ? '总控' : '活跃')}</div><div class="member-detail">当前活动成员；任务名称来自 Codex 任务标题适配器。</div></article>`;
-    const renderCard = (card, history) => {
+    const renderPositionTimeline = (card, context) => {
+      const entries = Array.isArray(context?.entries) ? context.entries : [];
+      const ids = [...new Set([card.source_entry_id, ...(card.related_entry_ids || [])].filter(Boolean))];
+      const related = ids.map((id) => entries.find((entry) => String(entry.entry_id) === String(id))).filter(Boolean);
+      related.sort((left, right) => Number(left.global_event_seq ?? left.entry_seq ?? 0) - Number(right.global_event_seq ?? right.entry_seq ?? 0));
+      if (!related.length) {
+        return `<div class="position-timeline"><div class="timeline-empty">当前注入切片未包含观点关联事件；${card.source_entry_id ? `来源条目 ${escapeHtml(card.source_entry_id)} 可通过 get-entry 精确检索。` : '暂无可排序的来源条目。'}</div></div>`;
+      }
+      return `<div class="position-timeline">${related.map((entry, index) => {
+        const sequence = entry.global_event_seq ?? entry.entry_seq ?? '—';
+        const time = entry.created_at ? ` · ${entry.created_at}` : '';
+        const author = entry.author_task_title ? ` · ${entry.author_task_title}` : '';
+        return `<div class="timeline-step ${index === related.length - 1 ? 'current' : ''}"><span class="timeline-label">${index + 1}. #${escapeHtml(sequence)} · ${escapeHtml(text(entry.entry_type, '观点事件'))}</span><span class="timeline-source">${escapeHtml(`${time}${author}`)}</span></div>`;
+      }).join('')}</div>`;
+    };
+    const renderCard = (card, history, context = {}) => {
       const badges = card.badges || {};
       return `<article class="member-card ${history ? 'history' : ''}">
         <div class="member-top"><div><div class="member-title">${escapeHtml(text(card.codex_task_title, '任务名称待同步'))}</div><div class="member-detail">${history ? '历史诊断证据 · 已退出成员' : '当前工作组成员'} · scope=${escapeHtml(text(card.scope))}</div></div>${badge(history ? '历史只读' : '观点卡')}</div>
+        ${renderPositionTimeline(card, context)}
         <div class="claim"><span class="label">核心论点：</span>${escapeHtml(text(card.core_claim, '未提供'))}</div>
         <div class="member-detail"><span class="label">最强证据：</span>${escapeHtml(text(card.strongest_evidence, '未提供'))}</div>
         <div class="member-detail"><span class="label">最强反证/质疑：</span>${escapeHtml(text(card.strongest_counterevidence, '未提供'))}</div>
@@ -2348,6 +2594,7 @@ def render_html() -> str:
       </article>`;
     };
     const renderEntries = (context) => {
+      if (!moduleEnabled('events')) return '';
       const allEntries = context.entries || [];
       const summary = context.event_summary || {};
       const entries = showAllEvents ? allEntries : allEntries.filter((entry) => entry.is_core_event !== false);
@@ -2359,10 +2606,11 @@ def render_html() -> str:
         const seqLabel = showAllEvents ? `工作组总流水号 #${globalSeq} · 核心局部序号 ${coreSeq}` : `当前核心事件 ${coreSeq} · 工作组总流水号 #${globalSeq}`;
         return `<article class="entry-card"><div class="entry-top"><div><div class="mono">${escapeHtml(seqLabel)}</div><div class="entry-title">${escapeHtml(text(entry.entry_type))} · ${escapeHtml(text(entry.event_category))}</div></div>${badge(text(entry.status, 'active'))}</div><div class="entry-detail">${escapeHtml(text(entry.author_task_title))} · ${escapeHtml(text(entry.content_preview, '无摘要'))}</div><div class="entry-detail">主题：${escapeHtml(text(entry.subject_key))} · 时间：${escapeHtml(text(entry.created_at))} · 置信度：${escapeHtml(text(entry.confidence))}</div>${refs(entry.evidence_refs)}<button class="ghost-button" data-entry-id="${escapeHtml(entry.entry_id)}">查看完整条目</button></article>`;
       }).join('');
-      return `<section class="section"><div class="section-title"><span>${filterLabel}</span><div><small>总流水 ${escapeHtml(summary.total_stream_count)} · 核心 ${escapeHtml(summary.core_event_count)} · 真实效果 ${escapeHtml(summary.real_effect_count)} · 证据 ${escapeHtml(summary.evidence_count)}</small><button class="ghost-button" data-event-toggle="1">${toggleLabel}</button></div></div>
+      return `<section class="section module-section" data-module="events"><div class="section-title"><span>${filterLabel}</span><div><small>总流水 ${escapeHtml(summary.total_stream_count)} · 核心 ${escapeHtml(summary.core_event_count)} · 真实效果 ${escapeHtml(summary.real_effect_count)} · 证据 ${escapeHtml(summary.evidence_count)}</small><button class="ghost-button" data-event-toggle="1">${toggleLabel}</button></div></div>
         <div class="notice">${escapeHtml(text(summary.core_filter_notice, '默认只展示会影响任务裁决或真实效果的核心事件。'))}</div>
-        <div class="scroll-box">${eventCards || '<div class="empty">当前筛选没有事件；可切换“查看全部流水”。</div>'}</div>
+        <div class="module-scroll tall"><div class="scroll-box">${eventCards || '<div class="empty">当前筛选没有事件；可切换“查看全部流水”。</div>'}</div>
         <div id="exact-entry-panel" class="exact-panel" hidden></div>
+        </div>
       </section>`;
     };
     function renderDetail(detail) {
@@ -2371,19 +2619,28 @@ def render_html() -> str:
       const context = detail.context || {};
       const retrieval = context.retrieval || {};
       const metrics = context.benefit_metrics || {};
+      const structuralIssues = detail.structural_issues || {issues: [], read_only: true};
       const cards = context.member_position_cards || [];
       const activeCards = cards.filter((card) => card.member_active);
       const historyCards = (context.historical_diagnostic_evidence || cards.filter((card) => !card.member_active));
+      const summaryBody = `<div class="metric-grid">${metric('活动成员', group.active_member_count)}${metric('工作组总流水', context.event_summary?.total_stream_count, 'append-only 全局序号不重写')}${metric('当前核心事件', context.event_summary?.core_event_count, `真实效果 ${context.event_summary?.real_effect_count ?? '—'}`)}${metric('证据事件', context.event_summary?.evidence_count, '当前工作组筛选')}</div>`;
+      const contextBody = `${renderBudget(context)}<div class="metric-grid" style="margin-top:12px">${metric('原始候选', retrieval.full_visible_entry_count)}${metric('遗漏条目', retrieval.omitted_entry_count)}${metric('遗漏成员观点', metrics.omitted_member_opinion_count ?? 0)}${metric('重复率', percent(metrics.duplicate_rate))}${metric('检索补充', metrics.retrieval_supplement_count ?? 0)}${metric('检索延迟', metrics.latency_ms == null ? '—' : `${metrics.latency_ms} ms`)}${metric('开放冲突', (context.open_conflict_entry_ids || []).length)}${metric('开放问题', (context.open_question_entry_ids || []).length)}</div>${retrieval.omitted_entry_count ? '<div class="notice warn">当前切片存在截断；遗漏条目仍可通过精确引用检索，不等于丢失原始记忆。</div>' : ''}`;
+      const positionBody = `<div class="member-grid">${activeCards.length ? activeCards.map((card) => renderCard(card, false, context)).join('') : '<div class="empty">当前没有可展示的活动成员观点卡。</div>'}</div>`;
+      const membersBody = `<div class="member-grid">${(group.members || []).length ? group.members.map(renderMember).join('') : '<div class="empty">暂无活动成员。</div>'}</div>`;
+      const historySection = moduleEnabled('history') ? `<details class="section module-section" data-module="history"><summary class="section-title"><span>历史诊断证据区</span><small>${historyCards.length} 张历史观点卡 · 不参与当前 claim</small></summary><div class="module-scroll"><div class="member-grid" style="margin-top:12px">${historyCards.length ? historyCards.map((card) => renderCard(card, true, context)).join('') : '<div class="empty">暂无已退出成员的历史诊断证据。</div>'}</div></div></details>` : '';
+      const boundaryBody = `<div class="notice">${escapeHtml(text(context.notice))}<br>当前页只读；不会自动 claim、不会重启任务、不会把历史成员重新放回活动成员列表。</div>`;
       const html = `<div class="detail-inner">
         <div class="detail-head"><div><h2>${escapeHtml(text(group.display_title, '工作组'))}</h2><p>${escapeHtml(text(detail.objective, '未提供目标'))}</p></div><div class="read-only">只读 · ${escapeHtml(text(detail.state))}</div></div>
-        <section class="section"><div class="section-title"><span>运行摘要</span><small>来源：工作组 runtime 只读适配器</small></div><div class="metric-grid">${metric('活动成员', group.active_member_count)}${metric('工作组总流水', context.event_summary?.total_stream_count, 'append-only 全局序号不重写')}${metric('当前核心事件', context.event_summary?.core_event_count, `真实效果 ${context.event_summary?.real_effect_count ?? '—'}`)}${metric('证据事件', context.event_summary?.evidence_count, '当前工作组筛选')}</div></section>
-        <section class="section"><div class="section-title"><span>上下文边界</span><small>context_kind=${escapeHtml(text(context.context_kind))}</small></div>${renderBudget(context)}<div class="metric-grid" style="margin-top:12px">${metric('原始候选', retrieval.full_visible_entry_count)}${metric('遗漏条目', retrieval.omitted_entry_count)}${metric('遗漏成员观点', metrics.omitted_member_opinion_count ?? 0)}${metric('重复率', percent(metrics.duplicate_rate))}${metric('检索补充', metrics.retrieval_supplement_count ?? 0)}${metric('检索延迟', metrics.latency_ms == null ? '—' : `${metrics.latency_ms} ms`)}${metric('开放冲突', (context.open_conflict_entry_ids || []).length)}${metric('开放问题', (context.open_question_entry_ids || []).length)}</div>${retrieval.omitted_entry_count ? '<div class="notice warn">当前切片存在截断；遗漏条目仍可通过精确引用检索，不等于丢失原始记忆。</div>' : ''}</section>
+        ${renderModulePicker()}
+        ${moduleSection('summary', '运行摘要', '来源：工作组 runtime 只读适配器', summaryBody, 'compact')}
+        ${moduleSection('context', '上下文边界', `context_kind=${text(context.context_kind)}`, contextBody, 'tall')}
         ${renderTaskPool(detail.task_pool || {})}
-        <section class="section"><div class="section-title"><span>当前成员观点卡 <small>member_position_cards</small></span><small>${activeCards.length} 名活动成员 · 已退出成员不占活动位</small></div><div class="member-grid">${activeCards.length ? activeCards.map((card) => renderCard(card, false)).join('') : '<div class="empty">当前没有可展示的活动成员观点卡。</div>'}</div></section>
-        <section class="section"><div class="section-title"><span>当前工作组成员</span><small>实际 Codex 任务名称</small></div><div class="member-grid">${(group.members || []).length ? group.members.map(renderMember).join('') : '<div class="empty">暂无活动成员。</div>'}</div></section>
+        ${renderStructuralIssues(structuralIssues)}
+        ${moduleSection('position_cards', '当前成员观点卡 · member_position_cards', `${activeCards.length} 名活动成员 · 已退出成员不占活动位`, positionBody, 'tall')}
+        ${moduleSection('members', '当前工作组成员', '实际 Codex 任务名称', membersBody, 'compact')}
         ${renderEntries(context)}
-        <details class="section"><summary class="section-title"><span>历史诊断证据区</span><small>${historyCards.length} 张历史观点卡 · 不参与当前 claim</small></summary><div class="member-grid" style="margin-top:12px">${historyCards.length ? historyCards.map((card) => renderCard(card, true)).join('') : '<div class="empty">暂无已退出成员的历史诊断证据。</div>'}</div></details>
-        <section class="section"><div class="section-title"><span>来源与边界</span><small>不改变 project truth</small></div><div class="notice">${escapeHtml(text(context.notice))}<br>当前页只读；不会自动 claim、不会重启任务、不会把历史成员重新放回活动成员列表。</div></section>
+        ${historySection}
+        ${moduleSection('boundary', '来源与边界', '不改变 project truth', boundaryBody, 'compact')}
       </div>`;
       document.querySelector('#detail').innerHTML = html;
     }
@@ -2437,6 +2694,19 @@ def render_html() -> str:
         document.querySelector('#updated').textContent = String(error.message || error);
       }
     }
+    document.addEventListener('change', (event) => {
+      const moduleToggle = event.target.closest('[data-module-toggle]');
+      if (moduleToggle) {
+        moduleVisibility[moduleToggle.dataset.moduleToggle] = moduleToggle.checked;
+        if (currentDetail) renderDetail(currentDetail);
+        return;
+      }
+      const issueToggle = event.target.closest('[data-issue-filter]');
+      if (issueToggle) {
+        issueFilter[issueToggle.dataset.issueFilter] = issueToggle.value;
+        if (currentDetail) renderDetail(currentDetail);
+      }
+    });
     document.addEventListener('click', (event) => {
       const groupButton = event.target.closest('[data-group-id]');
       if (groupButton) { loadDetail(groupButton.dataset.groupId); return; }
@@ -2451,6 +2721,31 @@ def render_html() -> str:
 </body>
 </html>
 """
+
+
+def inject_demo_return_link(html: str) -> str:
+    """Add a visible bridge from the standalone demo to the project view.
+
+    The workgroup demo is intentionally served by a separate read-only process
+    (normally on port 8767), while the project-scoped construction state
+    machine is served on port 8766.  Keeping this as a small HTML-only
+    decoration avoids mixing the two runtime projections or inventing a second
+    navigation state.
+    """
+    link = (
+        f'<a href="{DEFAULT_CONSTRUCTION_DEMO_URL}" '
+        'aria-label="返回项目状态机" '
+        'style="position:fixed;right:22px;top:18px;z-index:9999;'
+        'padding:9px 14px;border:1px solid #2f7b70;'
+        'border-radius:999px;background:#0b2a28;color:#dffbf3;'
+        'font:600 13px Segoe UI,Microsoft YaHei,sans-serif;'
+        'text-decoration:none;box-shadow:0 6px 22px #0008;'
+        'white-space:nowrap">← 返回项目状态机</a>'
+    )
+    body_marker = "<body>"
+    if body_marker in html:
+        return html.replace(body_marker, body_marker + link, 1)
+    return link + html
 
 
 class WorkgroupStatusHandler(BaseHTTPRequestHandler):
@@ -2493,8 +2788,11 @@ class WorkgroupStatusHandler(BaseHTTPRequestHandler):
         )
         status["demo_mode"] = demo_mode
         if path in {"/", "/index.html"}:
+            html = render_html()
+            if demo_mode:
+                html = inject_demo_return_link(html)
             self.send_payload(
-                render_html().encode("utf-8"),
+                html.encode("utf-8"),
                 content_type="text/html; charset=utf-8",
             )
             return
@@ -2547,6 +2845,28 @@ class WorkgroupStatusHandler(BaseHTTPRequestHandler):
                 return
             self.send_payload(
                 (json.dumps(entry, ensure_ascii=False, indent=2) + "\n").encode(
+                    "utf-8"
+                ),
+                content_type="application/json; charset=utf-8",
+            )
+            return
+        if path == "/api/structural-issues":
+            group_id = str((query.get("group_id") or [""])[0]).strip()
+            issue_payload = structural_issues_projection(
+                runtime_root,
+                group_id,
+                status=str((query.get("status") or [""])[0]).strip() or None,
+                severity=str((query.get("severity") or [""])[0]).strip() or None,
+            ) if group_id else None
+            if issue_payload is None:
+                self.send_payload(
+                    b'{"ok":false,"error":"workgroup_not_found"}\n',
+                    content_type="application/json; charset=utf-8",
+                    status_code=404,
+                )
+                return
+            self.send_payload(
+                (json.dumps(issue_payload, ensure_ascii=False, indent=2) + "\n").encode(
                     "utf-8"
                 ),
                 content_type="application/json; charset=utf-8",

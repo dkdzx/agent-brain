@@ -27,6 +27,40 @@ from typing import Any, Iterable
 SCHEMA_VERSION = "agent_brain_workgroup_runtime_v1"
 COORDINATION_SCHEMA_VERSION = "agent_brain_workgroup_coordination_v1"
 COORDINATION_MODES = {"strict", "legacy"}
+DEFAULT_PARALLEL_ACTIVE_TASK_LIMIT = 10
+DEFAULT_WORKGROUP_MEMBER_LIMIT = 15
+DEFAULT_CONTEXT_BUDGET_BYTES = 1048576
+DEFAULT_CONTEXT_MIN_BUDGET_BYTES = 32768
+DEFAULT_CONTEXT_MAX_ENTRIES = 4096
+DEFAULT_MEMBER_POSITION_CARD_LIMIT = 15
+MIN_CONTEXT_BUDGET_BYTES = 8192
+DEFAULT_CONTEXT_BUDGET_MODE = "adaptive"
+CONTEXT_BUDGET_MODES = {"adaptive", "fixed"}
+DEFAULT_CONTEXT_BUDGET_LADDER_BYTES = (
+    32768,
+    65536,
+    131072,
+    262144,
+    524288,
+    1048576,
+)
+DEFAULT_CONTEXT_TARGET_COVERAGE = 0.95
+DEFAULT_CONTEXT_MIN_MARGINAL_GAIN = 0.03
+ENTRY_CONTEXT_PRIORITY = {
+    "LOCAL_DECISION": 100,
+    "CONFLICT_RECORDED": 95,
+    "FACT_CONFIRMED": 90,
+    "CURRENT_BEST_MODEL": 88,
+    "HYPOTHESIS_REJECTED": 85,
+    "QUESTION_OPENED": 82,
+    "SCOPE_WARNING": 80,
+    "PARTIAL_RESULT": 72,
+    "EVIDENCE_ATTACHED": 70,
+    "ARTIFACT_PUBLISHED": 68,
+    "HYPOTHESIS": 65,
+    "QUESTION_RESOLVED": 55,
+    "HANDOFF_READY": 50,
+}
 ROLES = {"controller", "worker", "reviewer", "observer"}
 ENTRY_TYPES = {
     "FACT_CONFIRMED",
@@ -391,7 +425,7 @@ def append_event_locked(
 
 
 def public_member(member: dict[str, Any]) -> dict[str, Any]:
-    return {
+    public = {
         "member_id": member["member_id"],
         "role": member["role"],
         "host_id": member["host_id"],
@@ -405,6 +439,222 @@ def public_member(member: dict[str, Any]) -> dict[str, Any]:
         "joined_at": member["joined_at"],
         "lease_expires_at": member["lease_expires_at"],
         "revoked_at": member.get("revoked_at"),
+    }
+    if member.get("codex_task_title"):
+        public["codex_task_title"] = member["codex_task_title"]
+    return public
+
+
+def compact_text(value: Any, max_chars: int = 360) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    else:
+        text = str(value)
+    text = " ".join(text.split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1] + "…"
+
+
+def first_content_value(
+    content: dict[str, Any],
+    keys: tuple[str, ...],
+    *,
+    max_chars: int = 360,
+) -> str | None:
+    for key in keys:
+        if key in content and content[key] not in (None, "", [], {}):
+            return compact_text(content[key], max_chars)
+    return None
+
+
+def entry_context_rank(entry: dict[str, Any]) -> tuple[int, int, int]:
+    status_priority = {
+        "active": 3,
+        "resolved": 2,
+        "rejected": 1,
+        "superseded": 0,
+    }.get(str(entry.get("status")), 0)
+    return (
+        status_priority,
+        ENTRY_CONTEXT_PRIORITY.get(str(entry.get("entry_type")), 0),
+        int(entry.get("entry_seq", 0)),
+    )
+
+
+def build_member_position_cards(
+    entries: list[dict[str, Any]],
+    members: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    member_map = {
+        str(item["member_id"]): item for item in members if item.get("member_id")
+    }
+    entries_by_member: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        author = str(entry.get("author_member_id", ""))
+        if not author:
+            continue
+        entries_by_member.setdefault(author, []).append(entry)
+
+    cards: list[dict[str, Any]] = []
+    for member_id, member_entries in entries_by_member.items():
+        member_entries.sort(key=entry_context_rank, reverse=True)
+        primary = member_entries[0]
+        content = primary.get("content")
+        if not isinstance(content, dict):
+            content = {"text": content}
+        member = member_map.get(member_id, {"member_id": member_id, "active": False})
+        evidence_refs: list[str] = []
+        for entry in member_entries[:3]:
+            for ref in entry.get("evidence_refs", []):
+                if ref not in evidence_refs:
+                    evidence_refs.append(str(ref))
+        cards.append(
+            {
+                "member_id": member_id,
+                "codex_task_title": member.get("codex_task_title"),
+                "thread_id": member.get("thread_id"),
+                "member_active": bool(member.get("active")),
+                "participation_status": (
+                    "active_member"
+                    if member.get("active")
+                    else "historical_diagnostic_evidence_only"
+                ),
+                "core_claim": first_content_value(
+                    content,
+                    (
+                        "core_claim",
+                        "claim",
+                        "ruling",
+                        "conclusion",
+                        "text",
+                    ),
+                ),
+                "strongest_evidence": first_content_value(
+                    content,
+                    (
+                        "strongest_evidence",
+                        "evidence",
+                        "delivered_effect",
+                    ),
+                )
+                or compact_text(evidence_refs[:2], 240),
+                "strongest_counterevidence": first_content_value(
+                    content,
+                    (
+                        "strongest_counterevidence",
+                        "contrary_evidence",
+                        "objection",
+                        "problems_found",
+                    ),
+                ),
+                "scope": primary.get("scope"),
+                "claim_ceiling": first_content_value(
+                    content,
+                    ("claim_ceiling", "cannot_prove", "scope_ceiling"),
+                    max_chars=260,
+                ),
+                "evidence_status": first_content_value(
+                    content,
+                    ("evidence_status", "review_status"),
+                    max_chars=120,
+                ),
+                "model_gate_status": first_content_value(
+                    content,
+                    ("model_gate_status", "model_compliance"),
+                    max_chars=120,
+                ),
+                "signing_authority": first_content_value(
+                    content,
+                    ("signing_authority", "acceptance_authority"),
+                    max_chars=120,
+                ),
+                "entry_status": primary.get("status"),
+                "source_entry_id": primary.get("entry_id"),
+                "related_entry_ids": [
+                    item.get("entry_id") for item in member_entries[:3]
+                ],
+                "evidence_refs": evidence_refs[:3],
+            }
+        )
+
+    cards.sort(
+        key=lambda card: (
+            not card["member_active"],
+            str(card["member_id"]),
+        )
+    )
+    return cards[:limit]
+
+
+def compact_context_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    content = entry.get("content")
+    if not isinstance(content, dict):
+        content = {"text": content}
+    compact_content: dict[str, Any] = {}
+    preferred_keys = (
+        "core_claim",
+        "claim",
+        "ruling",
+        "conclusion",
+        "text",
+        "strongest_evidence",
+        "evidence",
+        "delivered_effect",
+        "strongest_counterevidence",
+        "contrary_evidence",
+        "objection",
+        "problems_found",
+        "unresolved_questions",
+        "integration_risks",
+        "claim_ceiling",
+        "recommended_next_check",
+        "evidence_status",
+        "model_gate_status",
+        "signing_authority",
+    )
+    for key in preferred_keys:
+        if key not in content or content[key] in (None, "", [], {}):
+            continue
+        limit = 520 if key in {"core_claim", "claim", "text"} else 320
+        compact_content[key] = compact_text(content[key], limit)
+    if not compact_content:
+        compact_content["summary"] = compact_text(content, 640)
+    resolution = entry.get("resolution")
+    compact_resolution = None
+    if isinstance(resolution, dict):
+        compact_resolution = {
+            "status": resolution.get("status"),
+            "resolution": compact_text(resolution.get("resolution"), 320),
+            "resolved_by": resolution.get("resolved_by"),
+            "resolved_at": resolution.get("resolved_at"),
+        }
+    return {
+        "entry_id": entry.get("entry_id"),
+        "entry_seq": entry.get("entry_seq"),
+        "entry_type": entry.get("entry_type"),
+        "subject_key": entry.get("subject_key"),
+        "scope": entry.get("scope"),
+        "author_member_id": entry.get("author_member_id"),
+        "author_role": entry.get("author_role"),
+        "created_at": entry.get("created_at"),
+        "status": entry.get("status"),
+        "confidence": entry.get("confidence"),
+        "content": compact_content,
+        "content_is_compact_summary": True,
+        "payload_sha256": entry.get("payload_sha256"),
+        "content_hash": entry.get("content_hash"),
+        "evidence_refs": [str(item) for item in entry.get("evidence_refs", [])[:5]],
+        "supersedes_entry_ids": entry.get("supersedes_entry_ids", [])[:5],
+        "resolution": compact_resolution,
+        "full_entry_lookup": {
+            "command": "get-entry",
+            "entry_id": entry.get("entry_id"),
+        },
     }
 
 
@@ -468,6 +718,46 @@ def materialize_view(group_dir: Path) -> dict[str, Any]:
         "authority_bundle_sha256": meta["authority_bundle_sha256"],
         "loopx_goal_id": meta["loopx_goal_id"],
         "member_registry_sha256": meta["member_registry_sha256"],
+        "context_policy": {
+            "mode": meta.get(
+                "context_budget_mode", DEFAULT_CONTEXT_BUDGET_MODE
+            ),
+            "budget_bytes": int(
+                meta.get("context_budget_bytes", DEFAULT_CONTEXT_BUDGET_BYTES)
+            ),
+            "minimum_budget_bytes": int(
+                meta.get(
+                    "context_min_budget_bytes",
+                    DEFAULT_CONTEXT_MIN_BUDGET_BYTES,
+                )
+            ),
+            "budget_ladder_bytes": meta.get(
+                "context_budget_ladder_bytes",
+                list(DEFAULT_CONTEXT_BUDGET_LADDER_BYTES),
+            ),
+            "target_coverage": float(
+                meta.get(
+                    "context_target_coverage",
+                    DEFAULT_CONTEXT_TARGET_COVERAGE,
+                )
+            ),
+            "minimum_marginal_gain": float(
+                meta.get(
+                    "context_min_marginal_gain",
+                    DEFAULT_CONTEXT_MIN_MARGINAL_GAIN,
+                )
+            ),
+            "max_entries": int(
+                meta.get("context_max_entries", DEFAULT_CONTEXT_MAX_ENTRIES)
+            ),
+            "member_position_card_limit": int(
+                meta.get(
+                    "member_position_card_limit",
+                    DEFAULT_MEMBER_POSITION_CARD_LIMIT,
+                )
+            ),
+            "context_is_injection_slice_not_complete_memory": True,
+        },
         "view_version": events[-1]["seq"] if events else 0,
         "event_chain_head": events[-1]["event_hash"] if events else "GENESIS",
         "members": [
@@ -648,6 +938,76 @@ def command_create(args: argparse.Namespace) -> dict[str, Any]:
     root.mkdir(parents=True, exist_ok=True)
     if args.coordination_mode not in COORDINATION_MODES:
         raise BrainError("COORDINATION_MODE_INVALID", args.coordination_mode)
+    if args.member_limit < 1:
+        raise BrainError("MEMBER_LIMIT_INVALID", str(args.member_limit))
+    if args.parallel_active_task_limit < 1:
+        raise BrainError(
+            "PARALLEL_ACTIVE_TASK_LIMIT_INVALID",
+            str(args.parallel_active_task_limit),
+        )
+    if args.context_budget_bytes < MIN_CONTEXT_BUDGET_BYTES:
+        raise BrainError(
+            "CONTEXT_BUDGET_TOO_SMALL",
+            f"{args.context_budget_bytes} < {MIN_CONTEXT_BUDGET_BYTES}",
+        )
+    if args.context_min_budget_bytes < MIN_CONTEXT_BUDGET_BYTES:
+        raise BrainError(
+            "CONTEXT_MIN_BUDGET_TOO_SMALL",
+            (
+                f"{args.context_min_budget_bytes} "
+                f"< {MIN_CONTEXT_BUDGET_BYTES}"
+            ),
+        )
+    if args.context_min_budget_bytes > args.context_budget_bytes:
+        raise BrainError(
+            "CONTEXT_BUDGET_RANGE_INVALID",
+            (
+                f"minimum={args.context_min_budget_bytes}; "
+                f"maximum={args.context_budget_bytes}"
+            ),
+        )
+    if args.context_budget_mode not in CONTEXT_BUDGET_MODES:
+        raise BrainError(
+            "CONTEXT_BUDGET_MODE_INVALID",
+            args.context_budget_mode,
+        )
+    if not 0 < args.context_target_coverage <= 1:
+        raise BrainError(
+            "CONTEXT_TARGET_COVERAGE_INVALID",
+            str(args.context_target_coverage),
+        )
+    if not 0 <= args.context_min_marginal_gain <= 1:
+        raise BrainError(
+            "CONTEXT_MIN_MARGINAL_GAIN_INVALID",
+            str(args.context_min_marginal_gain),
+        )
+    if args.context_max_entries < 1:
+        raise BrainError(
+            "CONTEXT_MAX_ENTRIES_INVALID",
+            str(args.context_max_entries),
+        )
+    if args.member_position_card_limit < 1:
+        raise BrainError(
+            "MEMBER_POSITION_CARD_LIMIT_INVALID",
+            str(args.member_position_card_limit),
+        )
+    effective_position_card_limit = min(
+        args.member_position_card_limit,
+        args.member_limit,
+    )
+    budget_ladder = sorted(
+        {
+            args.context_min_budget_bytes,
+            *(
+                value
+                for value in DEFAULT_CONTEXT_BUDGET_LADDER_BYTES
+                if args.context_min_budget_bytes
+                <= value
+                <= args.context_budget_bytes
+            ),
+            args.context_budget_bytes,
+        }
+    )
     if not args.allow_concurrent_groups:
         existing_group = find_active_identity_membership(
             root,
@@ -690,6 +1050,18 @@ def command_create(args: argparse.Namespace) -> dict[str, Any]:
         "loopx_goal_id": args.loopx_goal_id,
         "coordination_mode": args.coordination_mode,
         "single_active_group_default": not args.allow_concurrent_groups,
+        "member_limit": args.member_limit,
+        "member_limit_includes_controller": True,
+        "parallel_active_task_limit": args.parallel_active_task_limit,
+        "parallel_active_task_limit_scope": "visible_tasks_across_active_workgroups",
+        "context_budget_bytes": args.context_budget_bytes,
+        "context_min_budget_bytes": args.context_min_budget_bytes,
+        "context_budget_mode": args.context_budget_mode,
+        "context_budget_ladder_bytes": budget_ladder,
+        "context_target_coverage": args.context_target_coverage,
+        "context_min_marginal_gain": args.context_min_marginal_gain,
+        "context_max_entries": args.context_max_entries,
+        "member_position_card_limit": effective_position_card_limit,
         "member_registry_sha256": None,
         "long_term_memory_mounted": False,
         "project_authority_write_enabled": False,
@@ -726,6 +1098,22 @@ def command_create(args: argparse.Namespace) -> dict[str, Any]:
                 "authority_bundle_sha256": args.authority_bundle_sha256,
                 "loopx_goal_id": args.loopx_goal_id,
                 "coordination_mode": args.coordination_mode,
+                "capacity_policy": {
+                    "member_limit": args.member_limit,
+                    "member_limit_includes_controller": True,
+                    "parallel_active_task_limit": args.parallel_active_task_limit,
+                },
+                "context_policy": {
+                    "mode": args.context_budget_mode,
+                    "budget_bytes": args.context_budget_bytes,
+                    "minimum_budget_bytes": args.context_min_budget_bytes,
+                    "budget_ladder_bytes": budget_ladder,
+                    "target_coverage": args.context_target_coverage,
+                    "minimum_marginal_gain": args.context_min_marginal_gain,
+                    "max_entries": args.context_max_entries,
+                    "member_position_card_limit": effective_position_card_limit,
+                    "context_is_injection_slice_not_complete_memory": True,
+                },
                 "controller": public_member(controller),
             },
         )
@@ -760,6 +1148,19 @@ def command_add_member(args: argparse.Namespace) -> dict[str, Any]:
         members_doc = read_json(group_dir / "members.json")
         if args.member_id in members_doc["members"]:
             raise BrainError("MEMBER_ALREADY_EXISTS", args.member_id)
+        member_limit = int(
+            meta.get("member_limit", DEFAULT_WORKGROUP_MEMBER_LIMIT)
+        )
+        active_member_count = sum(
+            1
+            for existing in members_doc["members"].values()
+            if existing.get("active") is True
+        )
+        if active_member_count >= member_limit:
+            raise BrainError(
+                "WORKGROUP_MEMBER_LIMIT_REACHED",
+                f"{active_member_count}/{member_limit} active members; controller included",
+            )
         if (
             meta.get("coordination_mode", "legacy") == "strict"
             and not args.allow_concurrent_groups
@@ -816,10 +1217,167 @@ def command_add_member(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def context_quality_metrics(
+    all_entries: list[dict[str, Any]],
+    included_entries: list[dict[str, Any]],
+    cards: list[dict[str, Any]],
+) -> dict[str, Any]:
+    all_authors = {
+        str(item.get("author_member_id"))
+        for item in all_entries
+        if item.get("author_member_id")
+    }
+    card_authors = {str(item["member_id"]) for item in cards}
+    member_coverage = (
+        len(card_authors & all_authors) / len(all_authors)
+        if all_authors
+        else 1.0
+    )
+    total_weight = sum(max(entry_context_rank(item)[1], 1) for item in all_entries)
+    included_weight = sum(
+        max(entry_context_rank(item)[1], 1) for item in included_entries
+    )
+    weighted_entry_coverage = (
+        included_weight / total_weight if total_weight else 1.0
+    )
+    included_ids = {item["entry_id"] for item in included_entries}
+    conflicts = [
+        item for item in all_entries if item["entry_type"] == "CONFLICT_RECORDED"
+    ]
+    questions = [
+        item for item in all_entries if item["entry_type"] == "QUESTION_OPENED"
+    ]
+    conflict_coverage = (
+        sum(item["entry_id"] in included_ids for item in conflicts)
+        / len(conflicts)
+        if conflicts
+        else 1.0
+    )
+    question_coverage = (
+        sum(item["entry_id"] in included_ids for item in questions)
+        / len(questions)
+        if questions
+        else 1.0
+    )
+    payload_hashes = [
+        item.get("payload_sha256") or item.get("content_hash")
+        for item in included_entries
+    ]
+    payload_hashes = [item for item in payload_hashes if item]
+    redundancy_ratio = (
+        1.0 - (len(set(payload_hashes)) / len(payload_hashes))
+        if payload_hashes
+        else 0.0
+    )
+    score = (
+        0.30 * member_coverage
+        + 0.40 * weighted_entry_coverage
+        + 0.15 * conflict_coverage
+        + 0.15 * question_coverage
+    )
+    return {
+        "coverage_score": round(score, 6),
+        "member_position_coverage": round(member_coverage, 6),
+        "weighted_entry_coverage": round(weighted_entry_coverage, 6),
+        "open_conflict_coverage": round(conflict_coverage, 6),
+        "open_question_coverage": round(question_coverage, 6),
+        "redundancy_ratio": round(redundancy_ratio, 6),
+    }
+
+
+def _fit_context_to_budget(
+    result: dict[str, Any],
+    budget_bytes: int,
+    omitted_ids: list[str],
+) -> dict[str, Any]:
+    # Position cards are the durable coordination index. Reduce raw injected
+    # entries first; never silently claim the resulting slice is complete.
+    while len(canonical_bytes(result)) > budget_bytes and result["entries"]:
+        removed = result["entries"].pop()
+        removed_id = removed["entry_id"]
+        if removed_id not in omitted_ids:
+            omitted_ids.insert(0, removed_id)
+        included_ids = {item["entry_id"] for item in result["entries"]}
+        result["open_question_entry_ids"] = [
+            item
+            for item in result["open_question_entry_ids"]
+            if item in included_ids
+        ]
+        result["open_conflict_entry_ids"] = [
+            item
+            for item in result["open_conflict_entry_ids"]
+            if item in included_ids
+        ]
+        result["current_best_model_entry_ids"] = [
+            item
+            for item in result["current_best_model_entry_ids"]
+            if item in included_ids
+        ]
+
+    # In pathological cases keep active-member cards ahead of historical
+    # evidence. Exact entry lookup remains available for every omitted item.
+    while (
+        len(canonical_bytes(result)) > budget_bytes
+        and len(result["member_position_cards"]) > 1
+    ):
+        result["member_position_cards"].pop()
+
+    if len(canonical_bytes(result)) > budget_bytes and result["entries"]:
+        removed = result["entries"].pop()
+        if removed["entry_id"] not in omitted_ids:
+            omitted_ids.insert(0, removed["entry_id"])
+        result["context_budget"]["final_bytes"] = 0
+        result["context_budget"]["approx_tokens_div4"] = 0
+        return _fit_context_to_budget(result, budget_bytes, omitted_ids)
+    if len(canonical_bytes(result)) > budget_bytes:
+        raise BrainError(
+            "CONTEXT_BUDGET_UNSATISFIABLE",
+            (
+                f"minimum context requires {len(canonical_bytes(result))} bytes; "
+                f"budget={budget_bytes}"
+            ),
+        )
+    result["retrieval"]["included_entry_count"] = len(result["entries"])
+    result["retrieval"]["omitted_entry_count"] = len(omitted_ids)
+    result["retrieval"]["omitted_entry_id_sample"] = omitted_ids[:24]
+    result["retrieval"]["member_position_card_count"] = len(
+        result["member_position_cards"]
+    )
+    result["context_budget"]["final_bytes"] = 0
+    result["context_budget"]["approx_tokens_div4"] = 0
+    for _ in range(4):
+        measured = len(canonical_bytes(result))
+        approximate_tokens = (measured + 3) // 4
+        if (
+            result["context_budget"]["final_bytes"] == measured
+            and result["context_budget"]["approx_tokens_div4"]
+            == approximate_tokens
+        ):
+            break
+        result["context_budget"]["final_bytes"] = measured
+        result["context_budget"]["approx_tokens_div4"] = approximate_tokens
+    if len(canonical_bytes(result)) > budget_bytes and result["entries"]:
+        removed = result["entries"].pop()
+        if removed["entry_id"] not in omitted_ids:
+            omitted_ids.insert(0, removed["entry_id"])
+        result["context_budget"]["final_bytes"] = 0
+        result["context_budget"]["approx_tokens_div4"] = 0
+        return _fit_context_to_budget(result, budget_bytes, omitted_ids)
+    if len(canonical_bytes(result)) > budget_bytes:
+        raise BrainError(
+            "CONTEXT_BUDGET_UNSATISFIABLE",
+            (
+                f"measured context requires {len(canonical_bytes(result))} bytes; "
+                f"budget={budget_bytes}"
+            ),
+        )
+    return result
+
+
 def filtered_context(
     view: dict[str, Any], member: dict[str, Any], requested_scope: str
 ) -> dict[str, Any]:
-    entries = [
+    all_visible_entries = [
         item
         for item in view["entries"]
         if scope_allowed(member, item["scope"], "read_scope")
@@ -829,30 +1387,309 @@ def filtered_context(
             or requested_scope.startswith(item["scope"] + "/")
         )
     ]
-    visible_ids = {item["entry_id"] for item in entries}
+    policy = view.get("context_policy", {})
+    maximum_budget = int(
+        policy.get("budget_bytes", DEFAULT_CONTEXT_BUDGET_BYTES)
+    )
+    minimum_budget = int(
+        policy.get(
+            "minimum_budget_bytes",
+            min(DEFAULT_CONTEXT_MIN_BUDGET_BYTES, maximum_budget),
+        )
+    )
+    budget_mode = str(
+        policy.get("mode", DEFAULT_CONTEXT_BUDGET_MODE)
+    )
+    target_coverage = float(
+        policy.get("target_coverage", DEFAULT_CONTEXT_TARGET_COVERAGE)
+    )
+    minimum_marginal_gain = float(
+        policy.get(
+            "minimum_marginal_gain",
+            DEFAULT_CONTEXT_MIN_MARGINAL_GAIN,
+        )
+    )
+    max_entries = int(
+        policy.get("max_entries", DEFAULT_CONTEXT_MAX_ENTRIES)
+    )
+    card_limit = int(
+        policy.get(
+            "member_position_card_limit",
+            DEFAULT_MEMBER_POSITION_CARD_LIMIT,
+        )
+    )
+    ranked_source_entries = sorted(
+        all_visible_entries,
+        key=entry_context_rank,
+        reverse=True,
+    )
+    ranked_entries = [
+        compact_context_entry(item)
+        for item in ranked_source_entries[:max_entries]
+    ]
+    member_position_cards = build_member_position_cards(
+        all_visible_entries,
+        view.get("members", []),
+        limit=card_limit,
+    )
+
+    configured_ladder = [
+        int(item)
+        for item in policy.get(
+            "budget_ladder_bytes",
+            list(DEFAULT_CONTEXT_BUDGET_LADDER_BYTES),
+        )
+    ]
+    budget_ladder = sorted(
+        {
+            minimum_budget,
+            *(
+                item
+                for item in configured_ladder
+                if minimum_budget <= item <= maximum_budget
+            ),
+            maximum_budget,
+        }
+    )
+    if budget_mode == "fixed":
+        budget_ladder = [maximum_budget]
+
+    def build_slice(budget_bytes: int) -> dict[str, Any]:
+        hot_entries = list(ranked_entries)
+        visible_ids = {item["entry_id"] for item in hot_entries}
+        omitted_ids = [
+            item["entry_id"]
+            for item in all_visible_entries
+            if item["entry_id"] not in visible_ids
+        ]
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "group_id": view["group_id"],
+            "task_id": view["task_id"],
+            "state": view["state"],
+            "requested_scope": requested_scope,
+            "member": public_member(member),
+            "view_version": view["view_version"],
+            "event_chain_head": view["event_chain_head"],
+            "shared_semantic_hash": view["semantic_hash"],
+            "context_kind": "bounded_injection_slice",
+            "context_is_complete_workgroup_memory": False,
+            "entries": hot_entries,
+            "member_position_cards": list(member_position_cards),
+            "open_question_entry_ids": [
+                item
+                for item in view["open_question_entry_ids"]
+                if item in visible_ids
+            ],
+            "open_conflict_entry_ids": [
+                item
+                for item in view["open_conflict_entry_ids"]
+                if item in visible_ids
+            ],
+            "current_best_model_entry_ids": [
+                item
+                for item in view["current_best_model_entry_ids"]
+                if item in visible_ids
+            ],
+            "authority_notice": {
+                "host_control_plane_is_final_authority": True,
+                "shared_brain_is_long_term_memory": False,
+                "shared_brain_entries_are_project_truth": False,
+            },
+            "retrieval": {
+                "full_visible_entry_count": len(all_visible_entries),
+                "included_entry_count": len(hot_entries),
+                "omitted_entry_count": len(omitted_ids),
+                "omitted_entry_id_sample": omitted_ids[:24],
+                "member_position_card_count": len(member_position_cards),
+                "member_position_card_limit": card_limit,
+                "exact_entry_lookup_available": True,
+                "exact_entry_lookup_command": "get-entry",
+                "raw_event_archive_preserved": True,
+            },
+            "context_budget": {
+                "mode": budget_mode,
+                "budget_bytes": budget_bytes,
+                "minimum_budget_bytes": minimum_budget,
+                "maximum_budget_bytes": maximum_budget,
+                "max_entries_scan_guard": max_entries,
+                "policy": (
+                    "member_position_cards_first_then_ranked_hot_entries"
+                ),
+            },
+        }
+        return _fit_context_to_budget(result, budget_bytes, omitted_ids)
+
+    candidates: list[dict[str, Any]] = []
+    budget_attempts: list[dict[str, Any]] = []
+    for budget in budget_ladder:
+        try:
+            candidate = build_slice(budget)
+        except BrainError as exc:
+            if exc.code != "CONTEXT_BUDGET_UNSATISFIABLE":
+                raise
+            budget_attempts.append(
+                {
+                    "budget_bytes": budget,
+                    "available": False,
+                    "failure": exc.code,
+                    "message": exc.message,
+                }
+            )
+            continue
+        metrics = context_quality_metrics(
+            all_visible_entries,
+            candidate["entries"],
+            candidate["member_position_cards"],
+        )
+        row = {
+            "budget_bytes": budget,
+            "result": candidate,
+            "metrics": metrics,
+        }
+        candidates.append(row)
+        budget_attempts.append(
+            {
+                "budget_bytes": budget,
+                "available": True,
+                "candidate": row,
+            }
+        )
+
+    if not candidates:
+        raise BrainError(
+            "CONTEXT_BUDGET_UNSATISFIABLE",
+            (
+                "no configured budget can preserve the minimum position-card "
+                f"context; maximum={maximum_budget}"
+            ),
+        )
+
+    selected_index = len(candidates) - 1
+    selected_reason = "maximum_budget_reached_before_elbow"
+    if budget_mode == "fixed":
+        selected_reason = "fixed_budget_requested"
+    else:
+        for index, candidate in enumerate(candidates):
+            score = candidate["metrics"]["coverage_score"]
+            if index + 1 == len(candidates) and score >= target_coverage:
+                selected_index = index
+                selected_reason = "target_coverage_reached"
+                break
+            if index + 1 < len(candidates):
+                next_score = candidates[index + 1]["metrics"]["coverage_score"]
+                marginal_gain = next_score - score
+                if (
+                    score >= target_coverage
+                    and marginal_gain < minimum_marginal_gain
+                ):
+                    selected_index = index
+                    selected_reason = (
+                        "target_coverage_and_marginal_gain_elbow_reached"
+                    )
+                    break
+                if score >= 0.75 and marginal_gain < minimum_marginal_gain:
+                    selected_index = index
+                    selected_reason = "marginal_gain_elbow_reached"
+                    break
+
+    selected = candidates[selected_index]["result"]
+    curve = []
+    previous_score: float | None = None
+    for attempt in budget_attempts:
+        if not attempt["available"]:
+            curve.append(
+                {
+                    "budget_bytes": attempt["budget_bytes"],
+                    "available": False,
+                    "failure": attempt["failure"],
+                    "marginal_gain_from_previous": None,
+                }
+            )
+            continue
+        candidate = attempt["candidate"]
+        score = float(candidate["metrics"]["coverage_score"])
+        curve.append(
+            {
+                "budget_bytes": candidate["budget_bytes"],
+                "available": True,
+                "final_bytes": candidate["result"]["context_budget"][
+                    "final_bytes"
+                ],
+                "included_entry_count": candidate["result"]["retrieval"][
+                    "included_entry_count"
+                ],
+                **candidate["metrics"],
+                "marginal_gain_from_previous": (
+                    None
+                    if previous_score is None
+                    else round(score - previous_score, 6)
+                ),
+            }
+        )
+        previous_score = score
+    selected["context_budget"]["selected_budget_bytes"] = candidates[
+        selected_index
+    ]["budget_bytes"]
+    selected["context_budget"]["selected_reason"] = selected_reason
+    selected["context_budget"]["target_coverage"] = target_coverage
+    selected["context_budget"][
+        "minimum_marginal_gain"
+    ] = minimum_marginal_gain
+    selected["context_budget_curve"] = curve
+    omitted_ids = [
+        item["entry_id"]
+        for item in all_visible_entries
+        if item["entry_id"]
+        not in {entry["entry_id"] for entry in selected["entries"]}
+    ]
+    return _fit_context_to_budget(
+        selected,
+        int(selected["context_budget"]["selected_budget_bytes"]),
+        omitted_ids,
+    )
+
+
+def command_get_entry(args: argparse.Namespace) -> dict[str, Any]:
+    group_dir = group_dir_for(Path(args.root), args.group_id)
+    with group_lock(group_dir):
+        _, member = authenticate(
+            group_dir,
+            member_id=args.member_id,
+            lease_token=args.lease_token,
+            host_id=args.host_id,
+            thread_id=args.thread_id,
+            requested_scope=args.scope,
+        )
+        view = materialize_view(group_dir)
+        entry = next(
+            (
+                item
+                for item in view["entries"]
+                if item["entry_id"] == args.entry_id
+            ),
+            None,
+        )
+        if entry is None:
+            raise BrainError("ENTRY_NOT_FOUND", args.entry_id)
+        if not (
+            scope_allowed(member, entry["scope"], "read_scope")
+            and (
+                entry["scope"] == args.scope
+                or entry["scope"].startswith(args.scope + "/")
+                or args.scope.startswith(entry["scope"] + "/")
+            )
+        ):
+            raise BrainError("ENTRY_SCOPE_DENIED", args.entry_id)
     return {
         "schema_version": SCHEMA_VERSION,
         "group_id": view["group_id"],
         "task_id": view["task_id"],
-        "state": view["state"],
-        "requested_scope": requested_scope,
-        "member": public_member(member),
+        "requested_scope": args.scope,
         "view_version": view["view_version"],
-        "event_chain_head": view["event_chain_head"],
-        "shared_semantic_hash": view["semantic_hash"],
-        "entries": entries,
-        "open_question_entry_ids": [
-            item for item in view["open_question_entry_ids"] if item in visible_ids
-        ],
-        "open_conflict_entry_ids": [
-            item for item in view["open_conflict_entry_ids"] if item in visible_ids
-        ],
-        "current_best_model_entry_ids": [
-            item for item in view["current_best_model_entry_ids"] if item in visible_ids
-        ],
+        "entry": entry,
         "authority_notice": {
             "host_control_plane_is_final_authority": True,
-            "shared_brain_is_long_term_memory": False,
             "shared_brain_entries_are_project_truth": False,
         },
     }
@@ -1295,6 +2132,51 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
         "view_version": view["view_version"],
         "semantic_hash": view["semantic_hash"],
         "counts": view["counts"],
+        "capacity_policy": {
+            "member_limit": meta.get(
+                "member_limit", DEFAULT_WORKGROUP_MEMBER_LIMIT
+            ),
+            "member_limit_includes_controller": meta.get(
+                "member_limit_includes_controller", True
+            ),
+            "parallel_active_task_limit": meta.get(
+                "parallel_active_task_limit",
+                DEFAULT_PARALLEL_ACTIVE_TASK_LIMIT,
+            ),
+        },
+        "context_policy": {
+            "mode": meta.get(
+                "context_budget_mode", DEFAULT_CONTEXT_BUDGET_MODE
+            ),
+            "budget_bytes": meta.get(
+                "context_budget_bytes", DEFAULT_CONTEXT_BUDGET_BYTES
+            ),
+            "minimum_budget_bytes": meta.get(
+                "context_min_budget_bytes",
+                DEFAULT_CONTEXT_MIN_BUDGET_BYTES,
+            ),
+            "budget_ladder_bytes": meta.get(
+                "context_budget_ladder_bytes",
+                list(DEFAULT_CONTEXT_BUDGET_LADDER_BYTES),
+            ),
+            "target_coverage": meta.get(
+                "context_target_coverage",
+                DEFAULT_CONTEXT_TARGET_COVERAGE,
+            ),
+            "minimum_marginal_gain": meta.get(
+                "context_min_marginal_gain",
+                DEFAULT_CONTEXT_MIN_MARGINAL_GAIN,
+            ),
+            "max_entries": meta.get(
+                "context_max_entries", DEFAULT_CONTEXT_MAX_ENTRIES
+            ),
+            "member_position_card_limit": meta.get(
+                "member_position_card_limit",
+                DEFAULT_MEMBER_POSITION_CARD_LIMIT,
+            ),
+            "context_is_injection_slice_not_complete_memory": True,
+            "exact_entry_lookup_available": True,
+        },
         "frozen_snapshot_sha256": meta.get("frozen_snapshot_sha256"),
         "handoff_sha256": meta.get("handoff_sha256"),
     }
@@ -1334,6 +2216,51 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--scope", action="append", required=True)
     create.add_argument("--lease-hours", type=int, default=24)
     create.add_argument("--expires-hours", type=int, default=48)
+    create.add_argument(
+        "--member-limit",
+        type=int,
+        default=DEFAULT_WORKGROUP_MEMBER_LIMIT,
+    )
+    create.add_argument(
+        "--parallel-active-task-limit",
+        type=int,
+        default=DEFAULT_PARALLEL_ACTIVE_TASK_LIMIT,
+    )
+    create.add_argument(
+        "--context-budget-bytes",
+        type=int,
+        default=DEFAULT_CONTEXT_BUDGET_BYTES,
+    )
+    create.add_argument(
+        "--context-min-budget-bytes",
+        type=int,
+        default=DEFAULT_CONTEXT_MIN_BUDGET_BYTES,
+    )
+    create.add_argument(
+        "--context-budget-mode",
+        choices=sorted(CONTEXT_BUDGET_MODES),
+        default=DEFAULT_CONTEXT_BUDGET_MODE,
+    )
+    create.add_argument(
+        "--context-target-coverage",
+        type=float,
+        default=DEFAULT_CONTEXT_TARGET_COVERAGE,
+    )
+    create.add_argument(
+        "--context-min-marginal-gain",
+        type=float,
+        default=DEFAULT_CONTEXT_MIN_MARGINAL_GAIN,
+    )
+    create.add_argument(
+        "--context-max-entries",
+        type=int,
+        default=DEFAULT_CONTEXT_MAX_ENTRIES,
+    )
+    create.add_argument(
+        "--member-position-card-limit",
+        type=int,
+        default=DEFAULT_MEMBER_POSITION_CARD_LIMIT,
+    )
     create.add_argument("--authority-bundle-sha256", required=True)
     create.add_argument("--loopx-goal-id", required=True)
     create.add_argument(
@@ -1361,6 +2288,13 @@ def build_parser() -> argparse.ArgumentParser:
     add_auth_arguments(context)
     context.add_argument("--scope", required=True)
     context.set_defaults(handler=command_context)
+
+    get_entry = sub.add_parser("get-entry")
+    get_entry.add_argument("--group-id", required=True)
+    add_auth_arguments(get_entry)
+    get_entry.add_argument("--scope", required=True)
+    get_entry.add_argument("--entry-id", required=True)
+    get_entry.set_defaults(handler=command_get_entry)
 
     post = sub.add_parser("post")
     post.add_argument("--group-id", required=True)

@@ -1,73 +1,98 @@
-flowchart LR
+flowchart TB
   subgraph A["Codex Tasks and Coordination"]
+    direction LR
     A1["Codex Multi-task"]
     A2["Trusted Identity<br/>host_id + thread_id<br/>→ role / scope / lease"]
-    A3["LoopX 0.4.1<br/>goal / claim / completion / handoff"]
-    A4["Single Active Workgroup by Default<br/>duplicate host_id + thread_id<br/>fails closed"]
+    A3["LoopX or equivalent<br/>goal / todo / claim / completion / handoff"]
+    A4["One writable workgroup per identity<br/>duplicates fail closed"]
     A1 --> A2
     A1 --> A3
     A2 --> A4
   end
 
   subgraph B["Temporary Workgroup Shared State"]
+    direction LR
     B1["workgroup_brain.py<br/>create / context / post / resolve"]
-    B2["members.json<br/>Members, Permissions, Lease Hash"]
-    B3["events.jsonl<br/>Append-only + File Lock + Hash Chain"]
-    B4["Reducer<br/>fsync + os.replace"]
-    B5["view.json<br/>Rebuildable View"]
-    B6["freeze / handoff / close<br/>FROZEN_SNAPSHOT + STABLE_HANDOFF"]
-    B7["coordination.json<br/>last context view_version + scope<br/>per member"]
-    B8{"Publish Version Gate<br/>expected_view_version<br/>equals current?"}
+    B2["members.json<br/>roles / permissions / title / lease"]
+    B3["events.jsonl<br/>append-only + lock + hash chain"]
+    B4["Reducer<br/>fsync + atomic replace"]
+    B5["view.json<br/>rebuildable hot view"]
+    B6["freeze / handoff / close<br/>frozen snapshot + stable handoff"]
+    B7["coordination.json<br/>last view version + scope per member"]
+    B8{"Freshness gate<br/>expected version = current?"}
     B1 --> B2
-    B1 -->|"context at each turn"| B5
-    B5 -->|"acknowledge read version"| B7
+    B1 -->|"context each turn"| B5
+    B5 -->|"acknowledge read"| B7
     B1 -->|"post / resolve"| B8
     B7 --> B8
     B5 --> B8
     B8 -->|"fresh: append"| B3
-    B8 -->|"stale: reject and reread"| B5
+    B8 -->|"stale: reject + reread"| B5
     B3 --> B4 --> B5
     B1 --> B6
   end
 
-  subgraph C["Long-term Memory"]
-    C1["Session Archive<br/>manifest + source snapshot"]
-    C2["Candidate Extraction<br/>classify + extract"]
-    C3["Temporal Merge<br/>merge + authority manifest"]
-    C4["Long-term Memory Bundle<br/>CORE + Superindices + Supersedes"]
-    C5["query_long_term_memory.py /<br/>verify_long_term_memory_bundle.py"]
-    C6["Graphiti Ingestion<br/>Optional; if unavailable<br/>live writes = 0"]
+  subgraph S["Read-only Shadow Memory Adapter"]
+    direction LR
+    S1["Source importer<br/>group / members / task pool / snapshot / lane receipts"]
+    S2["Source manifest<br/>path + sha256 + projection hash"]
+    S3["PRIVATE_SHADOW events<br/>provenance bootstrap + idempotent import"]
+    S4["Position cards<br/>claim / evidence / counterevidence / ceiling / title"]
+    S5["Context wrapper<br/>bounded slice + injection receipt + exact get-entry"]
+    S6["Checkpoint memory<br/>append-only candidates + supersedes"]
+    S7["Recovery reader<br/>rebuild view/cards after context loss"]
+    S1 --> S2 --> S3 --> S4 --> S5 --> S7
+    S4 --> S6
+    S3 --> S7
+  end
+
+  subgraph C["Long-term Memory and Review"]
+    direction LR
+    C1["Session archive<br/>manifest + source snapshot"]
+    C2["Candidate extraction<br/>classify + extract"]
+    C3["Temporal merge<br/>validity + authority manifest"]
+    C4["Long-term memory bundle<br/>CORE + indexes + supersedes"]
+    C5["Query / verify tools"]
+    C6["Graphiti pending queue<br/>approved import only; live writes default 0"]
     C1 --> C2 --> C3 --> C4 --> C5
     C4 -.-> C6
   end
 
   subgraph D["Authority and Observability"]
-    D1["Project Authority<br/>framework / gate / decision / handoff"]
-    D2["Incomplete Causal Index<br/>CAUSAL_GRAPH + DSM + coverage / gaps"]
-    D3["Controller Review<br/>pending review"]
-    D4["Read-only Workgroup Frontend<br/>ThreadingHTTPServer + sqlite3 title map"]
+    direction LR
+    D1["Host project authority<br/>framework / gate / decision / handoff"]
+    D2["Causal index<br/>coverage / gaps / task slice"]
+    D3["Controller review<br/>candidate and Graphiti approval"]
+    D4["Read-only dashboards<br/>workgroup + shadow diagnostics"]
     D1 --> D2
     D3 --> D1
   end
 
   A4 --> B1
-  A3 -. "Lifecycle Reconciliation" .-> B6
-  C5 -->|"Frozen Memory Slice"| B1
-  D1 -->|"Authority Hash"| B1
-  D2 -->|"Related Task Causal Slice"| B1
-  B6 -->|"Unreviewed Group-memory Candidates"| D3
-  D3 -->|"Approved Only"| C3
-  B2 -. "Read-only Member Projection" .-> D4
+  A3 -. "lifecycle reconciliation" .-> B6
+  B6 -. "source projections" .-> S1
+  S6 -->|"candidate: review required"| D3
+  D3 -->|"approved only"| C3
+  D3 -->|"approved Graphiti request"| C6
+  C5 -->|"frozen reviewed slice"| S5
+  D1 -->|"authority hash"| B1
+  D2 -->|"related causal slice"| S5
+  B2 -. "read-only member projection" .-> D4
+  S4 -. "diagnostic projection" .-> D4
 
-  E1["verify_workgroup_brain.py<br/>Independent Validation"]
-  E2["Wrong Identity, Duplicate Membership,<br/>Stale Context, Overreach, Expired Lease,<br/>and Post-freeze Writes All Fail Closed"]
-  B6 --> E1 --> E2
+  E1["Independent validation<br/>source equality + chain + negative tests"]
+  E2["Identity / duplicate / stale / scope / lease / tamper /<br/>unapproved promotion all fail closed"]
+  B6 --> E1
+  S7 --> E1
+  E1 --> E2
 
   classDef work fill:#ddf7ed,stroke:#24856d,color:#111;
   classDef memory fill:#fff4cc,stroke:#9a7d18,color:#111;
   classDef authority fill:#e7efff,stroke:#426fae,color:#111;
   classDef guard fill:#f3e8ff,stroke:#7651a8,color:#111;
+  classDef shadow fill:#e8f4ff,stroke:#3976a8,color:#111;
   class B1,B2,B3,B4,B5,B6,B7,B8 work;
   class C1,C2,C3,C4,C5,C6 memory;
   class D1,D2,D3,D4 authority;
+  class S1,S2,S3,S4,S5,S6,S7 shadow;
   class A1,A2,A3,A4,E1,E2 guard;

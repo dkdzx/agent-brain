@@ -1,7 +1,8 @@
 # agent-brain
 
-A small, project-owned state layer for coordinating coding-agent workgroups
-without treating chat history as durable memory.
+A small, project-owned, event-sourced and evidence-gated control plane for
+coordinating coding-agent workgroups without treating chat history as durable
+memory.
 
 ![Agent memory and workgroup architecture](assets/architecture-en.png)
 
@@ -21,9 +22,38 @@ several tasks. This repository separates four concerns:
 The model context becomes a cache. Durable state lives in files that can be
 verified and reconstructed.
 
+The architecture is deliberately more than a finite-state machine. A state
+machine describes legal lifecycle transitions; `agent-brain` also records the
+append-only evidence chain, binds claims to members/tasks/scopes, generates a
+bounded context projection, and keeps host-project authority outside the
+workgroup. A useful name for the whole system is an **evidence-gated,
+event-sourced multi-agent workgroup control plane**.
+
+The workgroup injection slice is adaptive, not the complete workgroup memory.
+The default budget ladder is 32/64/128/256/512 KB/1 MB. The runtime keeps one structured
+position card per relevant member (claim, evidence, counterevidence, scope,
+claim ceiling, model-gate/signing status and source references), fills the
+remaining budget with ranked hot entries, measures coverage and redundancy at
+each budget, and selects the first target-coverage point whose next doubling
+has also fallen below the marginal-gain threshold (or an earlier lower-score
+marginal-gain elbow).
+The ladder, hard maximum, coverage target and marginal-gain threshold are
+configurable per group; entry count is only a high scan guard. Older or omitted
+entries remain in the append-only event archive and can be retrieved exactly
+with `get-entry`. Removed members are omitted from the active member list while
+their diagnostic evidence can remain in position cards.
+
+For runtimes whose state is split across source projections, the opt-in shadow
+adapter in `src/agent_brain/workgroup_memory_shadow.py` imports only verified
+source bytes into an independent `PRIVATE_SHADOW` ledger. It rebuilds member
+position cards, emits injection receipts before continuation, creates
+checkpoint candidates, and places Graphiti imports behind an explicit review
+queue. It never writes the source runtime or host project truth.
+
 ## Implementation status
 
-Version `0.2.0` includes an executable reference core:
+Version `0.3.0` includes the executable reference core and the read-only
+shadow-memory/recovery adapter:
 
 | Capability | Status |
 |---|---|
@@ -32,6 +62,10 @@ Version `0.2.0` includes an executable reference core:
 | Single active workgroup per task identity by default | Implemented and exercised |
 | Independent workgroup verifier | Implemented and exercised |
 | Read-only local status page | Implemented and smoke-tested |
+| Read-only shadow-memory adapter with provenance and recovery | Implemented and tested |
+| Member position cards and exact omitted-entry lookup | Implemented and tested |
+| Adaptive bounded injection receipts | Implemented and tested |
+| Anonymous shadow-memory diagnostic frontend | Implemented and smoke-tested |
 | Provenance-aware local memory ledger | Implemented and tested |
 | Explicitly incomplete causal index | Implemented |
 | Graphiti import-request generation | Implemented; live writes disabled |
@@ -78,6 +112,18 @@ Run the tests:
 python -m unittest discover -s tests -v
 ```
 
+Run the anonymous shadow-memory flow:
+
+```powershell
+python examples/workgroup-memory-shadow/run_anonymous_shadow.py
+```
+
+This disposable example imports an anonymous source projection, verifies the
+event chain and independent Reader, creates position cards and a bounded slice,
+records a checkpoint candidate, generates a Graphiti pending-review request,
+deletes rebuildable projections, and reconstructs them from the append-only
+archive. It never connects to a user runtime or performs a live Graphiti write.
+
 Run the isolated durable workgroup-memory canary:
 
 ```powershell
@@ -101,6 +147,28 @@ python src/agent_brain/workgroup_status_frontend.py `
 ```
 
 Open `http://127.0.0.1:8766/`.
+
+The shadow-memory diagnostics page is a separate opt-in server and does not
+replace the normal workgroup page:
+
+```powershell
+python src/agent_brain/workgroup_memory_shadow_frontend.py `
+  --shadow-root .synthetic-shadow `
+  --host 127.0.0.1 `
+  --port 8770
+```
+
+It labels the complete archive, the current bounded injection slice, and
+long-term candidates separately. It also exposes `GENERATED_ONLY`,
+`SENT_BY_CONTROLLER`, and `PLATFORM_CONSUMPTION_UNKNOWN`; generating a slice
+does not prove that the Codex platform consumed it.
+
+The project-scoped construction state-machine frontend is provided by
+`src/agent_brain/construction_status_frontend.py`. It places the project
+identity above its child views (state machine, construction list, and change
+stream) and keeps the same verified bundle across all three views. The
+anonymous public version is documented in
+[`examples/frontend-demo/README.md`](examples/frontend-demo/README.md).
 
 Removed, expired, and revoked members are omitted from the visible workgroup
 member list. Their lifecycle remains reconstructable from the append-only
@@ -126,6 +194,7 @@ create
 add-member
 remove-member
 context
+get-entry
 post
 resolve
 freeze
@@ -176,16 +245,25 @@ src/agent_brain/
                                 plus strict context/version gate
   verify_workgroup_brain.py     independent reader/verifier
   workgroup_status_frontend.py  read-only local status page
+  construction_status_frontend.py
+                                project-scoped state machine, list and change stream
+  workgroup_memory_shadow.py    source-projection shadow importer,
+                                recovery, slices and review gates
+  workgroup_memory_shadow_frontend.py
+                                opt-in read-only shadow diagnostics page
   long_term_memory.py           provenance-aware memory ledger
   causal_index.py               incomplete causal index with gaps
   graphiti_export.py            optional Graphiti import-request builder
 examples/
   three_agent_demo.py           full synthetic lifecycle
   workgroup-memory-v5/          durable group-memory and recovery canary
+  workgroup-memory-shadow/      anonymous source-to-shadow lifecycle example
 tests/
 docs/
   overview.md
   reproduction-guide.md
+  workgroup-memory-shadow.md    shadow adapter and recovery contract
+  shadow-adapter-reverse-review.md
 assets/
   architecture-en.mmd           editable source based on the original diagram
   architecture-en.png           rendered architecture diagram
@@ -195,6 +273,9 @@ assets/
 
 - [Short technical overview](docs/overview.md)
 - [Full reproduction guide](docs/reproduction-guide.md)
+- [Workgroup memory shadow and recovery contract](docs/workgroup-memory-shadow.md)
+- [Shadow adapter reverse review](docs/shadow-adapter-reverse-review.md)
+- [Public release checklist](docs/release-checklist.md)
 - [Security and publication boundary](SECURITY.md)
 - [Temporary workgroup prompt pack](prompts/workgroup-modes.zh-CN.md)
 
