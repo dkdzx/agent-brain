@@ -15,7 +15,9 @@ from agent_brain.workgroup_status_frontend import (
     build_workgroup_status,
     exact_entry_projection,
     group_detail_projection,
+    inject_demo_return_link,
     render_html,
+    structural_issues_projection,
 )
 
 
@@ -28,6 +30,12 @@ def write_json(path: Path, value: object) -> None:
 
 
 class FrontendProjectionTest(unittest.TestCase):
+    def test_anonymous_demo_has_return_project_state_machine_link(self) -> None:
+        html = inject_demo_return_link(render_html())
+        self.assertIn('href="http://127.0.0.1:8766/?demo=1"', html)
+        self.assertIn("返回项目状态机", html)
+        self.assertIn("position:fixed", html)
+
     def test_status_page_separates_running_and_archived_groups(self) -> None:
         html = render_html()
         self.assertIn("运行中的工作组", html)
@@ -82,6 +90,9 @@ class FrontendProjectionTest(unittest.TestCase):
         self.assertEqual(context["event_summary"]["core_event_count"], 4)
         self.assertEqual(context["event_summary"]["real_effect_count"], 1)
         self.assertEqual(context["event_summary"]["evidence_count"], 4)
+        self.assertEqual(detail["structural_issues"]["counts"]["all"], 2)
+        self.assertEqual(detail["structural_issues"]["counts"]["active"], 1)
+        self.assertEqual(detail["structural_issues"]["issues"][0]["status"], "active")
         self.assertEqual(
             sorted(
                 entry["core_event_seq"]
@@ -174,8 +185,36 @@ class FrontendProjectionTest(unittest.TestCase):
             "/api/entry",
             "任务池",
             "历史诊断证据区",
+            "显示模块",
+            "data-module-toggle",
+            "module-scroll",
+            "position-timeline",
+            "重大结构性问题",
+            "data-issue-filter",
+            "/api/structural-issues",
         ):
             self.assertIn(expected, html)
+
+    def test_structural_issue_projection_filters_by_status_and_severity(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent-brain-issues-") as temp:
+            root = Path(temp)
+            group = root / "group-001"
+            write_json(group / "group.json", {"group_id": "group-001", "state": "ACTIVE"})
+            write_json(
+                group / "structural_issues.json",
+                {
+                    "schema_version": "agent_brain_structural_issue_v1",
+                    "issues": [
+                        {"issue_id": "issue-a", "title": "active high", "severity": "high", "status": "active"},
+                        {"issue_id": "issue-b", "title": "resolved medium", "severity": "medium", "status": "resolved"},
+                    ],
+                },
+            )
+            active = structural_issues_projection(root, "group-001", status="active")
+            high = structural_issues_projection(root, "group-001", severity="high")
+            self.assertEqual([item["issue_id"] for item in active["issues"]], ["issue-a"])
+            self.assertEqual([item["issue_id"] for item in high["issues"]], ["issue-a"])
+            self.assertEqual(active["counts"]["all"], 2)
 
     def test_verified_member_task_title_wins_over_delegation_text(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent-brain-title-") as temp:

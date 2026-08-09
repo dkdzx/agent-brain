@@ -39,7 +39,10 @@ Active members are rendered as current position cards. A revoked or exited
 member is excluded from the active-member section and can only appear in the
 historical diagnostic evidence section. Every position card keeps the claim,
 strongest evidence, strongest counterevidence, scope, claim ceiling, evidence
-status, model-gate status, signing status, and exact-entry reference.
+status, model-gate status, signing status, and exact-entry reference. Related
+source entries are rendered as a local position timeline ordered by global
+event sequence; the timeline is a display projection and does not rewrite the
+append-only event sequence.
 
 ## 6. Task pool and event semantics
 
@@ -55,6 +58,17 @@ The left workgroup index excludes an `ACTIVE` directory that has no valid
 active members. Such a stale projection is counted as
 `ACTIVE_NO_ACTIVE_MEMBERS` for diagnosis instead of being shown as a running
 project with a misleading zero-member card.
+
+The detail page has a module visibility list. Operators can independently hide
+or show the task pool, structural issues, context slice, position cards,
+members, events, history, and boundary panels. Each long panel owns its own
+scroll container so the page does not grow without limit.
+
+The structural-issues panel is read-only and defaults to active issues. It
+supports severity/status filters and expandable impact, ruling, allowed route,
+forbidden interpretation, evidence references, and resolution references. The
+public fixture uses only anonymous issue text; private workgroup issue sidecars
+are not part of this repository demo.
 
 ## 7. Failure handling and verification
 

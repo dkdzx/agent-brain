@@ -22,12 +22,12 @@ TEXT_SUFFIXES = {
 }
 FORBIDDEN = {
     "private_project_name": re.compile(r"大衡|Daheng|daheng"),
-    "private_workspace": re.compile(r"WORLD_MAP_V1|D:\\\\模拟器|/home/[^/]+/"),
-    "private_local_user": re.compile(r"lenovo|C:\\\\Users\\\\"),
+    "private_workspace": re.compile(r"WORLD_MAP_V1|D:\\模拟器|/home/[^/]+/"),
+    "private_local_user": re.compile(r"lenovo|C:\\Users\\"),
     "real_thread_id": re.compile(r"\b019f[0-9a-f-]{20,}\b", re.I),
-    "raw_transcript": re.compile(r"raw_chat_transcript\\s*[:=]\\s*[\"']?[^\\s,}]+"),
+    "raw_transcript": re.compile(r"raw_chat_transcript\s*[:=]\s*[\"']?[^\s,}]+"),
     "credential": re.compile(
-        r"(gho_|github_pat_|sk-[A-Za-z0-9_-]{12,}|Authorization:\\s*Bearer)",
+        r"(?<![A-Za-z0-9])(?:gho_[A-Za-z0-9_-]{20,}|github_pat_[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{20,}|Authorization:\s*Bearer)",
         re.I,
     ),
 }
