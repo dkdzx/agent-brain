@@ -1514,7 +1514,20 @@ CONSTRUCTION_HTML = r"""<!doctype html>
     document.addEventListener('fullscreenchange',()=>{if(!document.fullscreenElement&&document.body.classList.contains('presentation-mode')){document.body.classList.remove('presentation-mode');const button=document.querySelector('#presentation-toggle');if(button){button.textContent=tr('presentation');button.setAttribute('aria-pressed','false')};const soft=document.querySelector('#show-soft');if(soft)soft.checked=false;renderGraph()}});
     async function fitGraph(){if(!S.bundle)return;if(selectedStructure()==='webgl3d'&&S.webgl?.native){S.webgl.fitRequested=true;webglFit(S.webgl);return}const graph=await computeGraphLayout(S.bundle.status.flow_graph.nodes||[],S.bundle.status.flow_graph.edges||[]),viewport=document.querySelector('#viewport');
       const widthScale=(viewport.clientWidth-30)/graph.width,heightScale=(viewport.clientHeight-30)/graph.height;S.scale=Math.max(.42,Math.min(.92,widthScale,heightScale));viewport.scrollTo(0,0);renderGraph()}
-    function zoomGraph(delta){if(selectedStructure()==='webgl3d'&&S.webgl?.native){S.webgl.distance=Math.max(240,Math.min(7000,S.webgl.distance*(delta>0?.82:1.22)));return}S.scale=Math.max(.42,Math.min(1.5,S.scale+delta));renderGraph()}
+    function applyGraphScale(){const canvas=document.querySelector('#canvas');if(canvas)canvas.style.transform=`scale(${S.scale})`}
+    function setGraphScale(next,anchorClientX=null,anchorClientY=null){
+      const viewport=document.querySelector('#viewport');if(!viewport)return;
+      const before=S.scale,after=Math.max(.42,Math.min(1.5,next));if(before===after)return;
+      const rect=viewport.getBoundingClientRect(),hasAnchor=Number.isFinite(anchorClientX)&&Number.isFinite(anchorClientY);
+      const anchorX=hasAnchor?(anchorClientX-rect.left+viewport.scrollLeft)/before:null;
+      const anchorY=hasAnchor?(anchorClientY-rect.top+viewport.scrollTop)/before:null;
+      S.scale=after;applyGraphScale();
+      if(hasAnchor)requestAnimationFrame(()=>{
+        viewport.scrollLeft=Math.max(0,anchorX*after-(anchorClientX-rect.left));
+        viewport.scrollTop=Math.max(0,anchorY*after-(anchorClientY-rect.top));
+      });
+    }
+    function zoomGraph(delta){if(selectedStructure()==='webgl3d'&&S.webgl?.native){S.webgl.distance=Math.max(240,Math.min(7000,S.webgl.distance*(delta>0?.82:1.22)));return}const viewport=document.querySelector('#viewport');if(!viewport)return;const rect=viewport.getBoundingClientRect();setGraphScale(S.scale+delta,rect.left+rect.width/2,rect.top+rect.height/2)}
     document.querySelector('#zoom-in').onclick=()=>zoomGraph(.1);document.querySelector('#zoom-out').onclick=()=>zoomGraph(-.1);
     document.querySelector('#fit').onclick=fitGraph;document.querySelector('#status-filter').onchange=renderGraph;document.querySelector('#show-soft').onchange=renderGraph;
     document.querySelector('#structure-select').onchange=event=>{const next=STRUCTURE_PROFILES.has(event.target.value)?event.target.value:'elk-right';try{localStorage.setItem('construction-layout',next)}catch(_error){}S.currentLayout=null;const url=new URL(location.href);url.searchParams.set('layout',next);history.replaceState(null,'',url);renderGraph()};
@@ -1529,7 +1542,7 @@ CONSTRUCTION_HTML = r"""<!doctype html>
     const initialStructure=document.querySelector('#structure-select');if(initialStructure)initialStructure.value=preferredStructure();
     const vp=document.querySelector('#viewport');let drag=null;vp.addEventListener('pointerdown',e=>{if(e.target.closest('.node'))return;drag={x:e.clientX,y:e.clientY,l:vp.scrollLeft,t:vp.scrollTop};vp.setPointerCapture(e.pointerId);vp.classList.add('dragging')});
     vp.addEventListener('pointermove',e=>{if(drag){vp.scrollLeft=drag.l-(e.clientX-drag.x);vp.scrollTop=drag.t-(e.clientY-drag.y)}});vp.addEventListener('pointerup',()=>{drag=null;vp.classList.remove('dragging')});
-    vp.addEventListener('wheel',event=>{if(selectedStructure()==='webgl3d'&&S.webgl?.native)return;event.preventDefault();if(!S.bundle)return;const rect=vp.getBoundingClientRect(),before=S.scale,factor=Math.exp(-event.deltaY*.001),next=Math.max(.42,Math.min(1.5,before*factor)),anchorX=(event.clientX-rect.left+vp.scrollLeft)/before,anchorY=(event.clientY-rect.top+vp.scrollTop)/before;S.scale=next;renderGraph();requestAnimationFrame(()=>{vp.scrollLeft=Math.max(0,anchorX*next-(event.clientX-rect.left));vp.scrollTop=Math.max(0,anchorY*next-(event.clientY-rect.top))})},{passive:false});
+    vp.addEventListener('wheel',event=>{if(selectedStructure()==='webgl3d'&&S.webgl?.native)return;event.preventDefault();event.stopPropagation();if(!S.bundle)return;const factor=Math.exp(-event.deltaY*.001);setGraphScale(S.scale*factor,event.clientX,event.clientY)},{passive:false});
     window.__CONSTRUCTION_HOOKS__={state:S,renderGraph:renderGraph,selectNode:selectNode,useUnifiedNodeHtml:false};
      refresh();setInterval(refresh,3000);
    </script>

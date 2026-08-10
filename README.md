@@ -52,7 +52,7 @@ queue. It never writes the source runtime or host project truth.
 
 ## Implementation status
 
-Version `0.4.0` includes the executable reference core, the read-only
+Version `0.4.1` includes the executable reference core, the read-only
 shadow-memory/recovery adapter, and the public construction/workgroup
 dashboards:
 
@@ -77,10 +77,12 @@ dashboards:
 The construction dashboard now supports multiple read-only graph presentations
 from the same verified flow graph: layered DAG, tree/radial/force projections,
 local manual arrangement, and a native WebGL 3D view. Chinese and English UI
-labels share the same data contract, and wheel zoom is anchored at the cursor.
+labels share the same data contract, and wheel zoom is anchored at the cursor
+without rebuilding the surrounding page or inspector. See the [v0.4.1 release
+notes](docs/release-v0.4.1.md).
 The workgroup dashboard separately reconciles registered membership with a
 fresh Codex thread-status projection and fails closed when that projection is
-missing or stale. See the [v0.4.0 release notes](docs/release-v0.4.0.md).
+missing or stale.
 
 The architecture diagram shows both the executable core and optional production
 extensions. The [reproduction guide](docs/reproduction-guide.md) is a target
