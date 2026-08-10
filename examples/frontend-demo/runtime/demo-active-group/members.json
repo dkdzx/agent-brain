@@ -13,7 +13,7 @@
       "write_scope": ["task/shared"],
       "added_at": "2026-08-08T10:00:00+08:00",
       "joined_at": "2026-08-08T10:00:10+08:00",
-      "lease_expires_at": "2026-08-09T10:00:00+08:00",
+      "lease_expires_at": "2099-12-31T23:59:59+08:00",
       "revoked_at": null
     },
     "demo-worker": {
@@ -29,7 +29,7 @@
       "write_scope": ["task/shared"],
       "added_at": "2026-08-08T10:00:00+08:00",
       "joined_at": "2026-08-08T10:01:00+08:00",
-      "lease_expires_at": "2026-08-09T10:00:00+08:00",
+      "lease_expires_at": "2099-12-31T23:59:59+08:00",
       "revoked_at": null
     },
     "demo-reviewer": {
@@ -45,7 +45,7 @@
       "write_scope": [],
       "added_at": "2026-08-08T10:00:00+08:00",
       "joined_at": "2026-08-08T10:01:10+08:00",
-      "lease_expires_at": "2026-08-09T10:00:00+08:00",
+      "lease_expires_at": "2099-12-31T23:59:59+08:00",
       "revoked_at": null
     },
     "demo-exited": {
