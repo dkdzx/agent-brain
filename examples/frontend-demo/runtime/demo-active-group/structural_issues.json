@@ -1,0 +1,42 @@
+{
+  "schema_version": "agent_brain_structural_issue_v1",
+  "group_id": "demo-active-group",
+  "issues": [
+    {
+      "issue_id": "DEMO-ISSUE-001",
+      "title": "演示参数层与长期事实层边界需要保持清晰",
+      "category": "authority-boundary",
+      "severity": "high",
+      "status": "active",
+      "discovered_at": "2026-08-08T10:02:30+08:00",
+      "affected_goal_or_path": "匿名演示目标 / 实验参数与长期事实边界",
+      "evidence_refs": ["demo://evidence/authority-boundary"],
+      "impact": "如果把演示参数直接当作长期事实，后续任务可能沿用未经验证的结论。",
+      "current_ruling": "演示参数可以按版本使用，但长期事实仍需要独立证据确认。",
+      "allowed_route": "记录版本、适用范围和回滚条件，再由上游审核是否提升。",
+      "forbidden_interpretation": "不能把演示参数宣称为项目最终事实。",
+      "owner_task_id": "demo-main-01",
+      "owner_task_name": "匿名边界复核",
+      "supersedes": [],
+      "resolution_refs": []
+    },
+    {
+      "issue_id": "DEMO-ISSUE-002",
+      "title": "待补充的异常恢复证据",
+      "category": "evidence-gap",
+      "severity": "medium",
+      "status": "resolved",
+      "discovered_at": "2026-08-08T09:40:00+08:00",
+      "affected_goal_or_path": "匿名恢复路径",
+      "evidence_refs": ["demo://evidence/recovery"],
+      "impact": "早期演示缺少异常恢复样例。",
+      "current_ruling": "已用匿名 fixture 补充恢复路径并归档。",
+      "allowed_route": "继续保留原始证据引用，必要时按 entry 精确检索。",
+      "forbidden_interpretation": "不能把匿名 fixture 当作生产验证。",
+      "owner_task_id": "demo-review-02",
+      "owner_task_name": "匿名恢复复核",
+      "supersedes": [],
+      "resolution_refs": ["demo://evidence/recovery-resolution"]
+    }
+  ]
+}

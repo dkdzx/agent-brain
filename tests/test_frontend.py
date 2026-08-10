@@ -192,8 +192,18 @@ class FrontendProjectionTest(unittest.TestCase):
             "重大结构性问题",
             "data-issue-filter",
             "/api/structural-issues",
+            "登记成员",
+            "组内实时运行任务",
+            "全项目实时运行任务",
+            "实时状态未同步",
+            "工作组标记状态",
+            "Codex实时线程状态",
+            "状态快照时间",
+            "/api/thread-status-projection",
         ):
             self.assertIn(expected, html)
+        self.assertNotIn("实时投影来源", html)
+        self.assertNotIn("状态投影来源", html)
 
     def test_structural_issue_projection_filters_by_status_and_severity(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent-brain-issues-") as temp:
@@ -387,14 +397,95 @@ class FrontendProjectionTest(unittest.TestCase):
 
             self.assertEqual(projected["active_member_count"], 1)
             self.assertEqual(projected["total_member_count"], 1)
+            self.assertEqual(projected["registered_member_count"], 2)
+            self.assertEqual(projected["historical_active_member_count"], 1)
+            self.assertIsNone(projected["realtime_active_member_count"])
+            self.assertEqual(projected["realtime_status_sync"], "UNSYNCED")
             self.assertEqual(
                 [member["member_id"] for member in projected["members"]],
                 ["controller"],
             )
-            self.assertNotIn(
-                "removed-reviewer",
-                json.dumps(status, ensure_ascii=False),
+            self.assertEqual(
+                [member["member_id"] for member in projected["registered_members"]],
+                ["controller", "removed-reviewer"],
             )
+
+    def test_realtime_projection_separates_history_group_and_project_counts(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent-brain-thread-status-") as temp:
+            root = Path(temp)
+            group = root / "group-001"
+            now = datetime.now().astimezone()
+            write_json(
+                group / "group.json",
+                {
+                    "group_id": "group-001",
+                    "task_id": "task-001",
+                    "objective": "status join",
+                    "state": "ACTIVE",
+                    "controller_member_id": "controller",
+                    "created_at": now.isoformat(timespec="seconds"),
+                },
+            )
+            write_json(
+                group / "members.json",
+                {
+                    "members": {
+                        "controller": {"member_id": "controller", "thread_id": "thread-001", "role": "controller", "active": True, "status": "ACTIVE"},
+                        "released": {"member_id": "released", "thread_id": "thread-002", "role": "reviewer", "active": False, "status": "RELEASED"},
+                        "idle-marked": {"member_id": "idle-marked", "thread_id": "thread-003", "role": "worker", "active": True, "status": "ACTIVE"},
+                    }
+                },
+            )
+            projection = root / "CODEX_THREAD_STATUS_PROJECTION.json"
+            write_json(
+                projection,
+                {
+                    "schema_version": "agent_brain_codex_thread_status_projection_v1",
+                    "generated_at": "2026-08-09T15:00:00+08:00",
+                    "source": "codex_app.list_threads",
+                    "threads": [
+                        {"thread_id": "thread-001", "title": "总控任务", "status": "active"},
+                        {"thread_id": "thread-002", "title": "已释放任务", "status": "idle"},
+                        {"thread_id": "thread-003", "title": "空闲任务", "status": "idle"},
+                        {"thread_id": "thread-unassigned", "title": "项目活动任务", "status": "active"},
+                    ],
+                },
+            )
+
+            status = build_workgroup_status(
+                root,
+                codex_state_db=root / "missing.sqlite",
+                title_map_path=root / "missing-titles.json",
+                thread_status_projection_path=projection,
+            )
+            projected = status["active_groups"][0]
+            self.assertEqual(projected["registered_member_count"], 3)
+            self.assertEqual(projected["historical_active_member_count"], 2)
+            self.assertEqual(projected["realtime_active_member_count"], 1)
+            self.assertEqual(projected["realtime_status_sync"], "SYNCED")
+            self.assertEqual(len(projected["unassigned_active_tasks"]), 1)
+            self.assertEqual(status["realtime_thread_status"]["active_thread_count"], 2)
+            self.assertEqual(status["realtime_thread_status"]["source"], "codex_app.list_threads")
+            controller = next(item for item in projected["registered_members"] if item["member_id"] == "controller")
+            idle_marked = next(item for item in projected["registered_members"] if item["member_id"] == "idle-marked")
+            self.assertEqual(controller["codex_realtime_status"], "ACTIVE")
+            self.assertFalse(controller["status_conflict"])
+            self.assertEqual(idle_marked["codex_realtime_status"], "IDLE")
+            self.assertTrue(idle_marked["status_conflict"])
+
+    def test_realtime_projection_schema_failure_is_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="agent-brain-thread-status-invalid-") as temp:
+            root = Path(temp)
+            projection = root / "CODEX_THREAD_STATUS_PROJECTION.json"
+            write_json(projection, {"threads": [{"thread_id": "thread-001", "status": "active"}]})
+            payload = build_workgroup_status(
+                root,
+                codex_state_db=root / "missing.sqlite",
+                title_map_path=root / "missing-titles.json",
+                thread_status_projection_path=projection,
+            )
+            self.assertEqual(payload["realtime_thread_status"]["status_sync"], "UNSYNCED")
+            self.assertIsNone(payload["realtime_thread_status"]["active_thread_count"])
 
 
 if __name__ == "__main__":

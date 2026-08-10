@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import sqlite3
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import parse_qs, urlparse
 
 try:
@@ -31,6 +32,7 @@ materialize_view = getattr(_workgroup_brain, "materialize_view", None)
 DEFAULT_RUNTIME_ROOT = Path.home() / ".agent-brain" / "runtime"
 DEFAULT_CODEX_STATE_DB = Path.home() / ".codex" / "state_5.sqlite"
 DEFAULT_TITLE_MAP = DEFAULT_RUNTIME_ROOT / "CODEX_THREAD_TITLE_MAP.json"
+DEFAULT_THREAD_STATUS_PROJECTION_NAME = "CODEX_THREAD_STATUS_PROJECTION.json"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8766
 DEFAULT_CONSTRUCTION_DEMO_URL = "http://127.0.0.1:8766/?demo=1"
@@ -65,6 +67,25 @@ MODEL_GATE_NONCOMPLIANT = "模型门不合规"
 STRUCTURAL_ISSUE_SCHEMA_VERSION = "agent_brain_structural_issue_v1"
 STRUCTURAL_ISSUE_STATUSES = {"active", "resolved", "superseded"}
 STRUCTURAL_ISSUE_SEVERITIES = {"critical", "high", "medium", "low"}
+THREAD_STATUS_PROJECTION_SCHEMA_VERSION = "agent_brain_codex_thread_status_projection_v1"
+DEFAULT_REALTIME_STATUS_MAX_AGE_SECONDS = 30
+UNKNOWN_STALE_THREAD_STATUS = "UNKNOWN_STALE"
+REALTIME_ACTIVE_THREAD_STATES = {"ACTIVE", "IN_PROGRESS", "CLAIMED", "RUNNING"}
+REALTIME_STATUS_ALIASES = {
+    "active": "ACTIVE",
+    "running": "ACTIVE",
+    "in_progress": "IN_PROGRESS",
+    "inprogress": "IN_PROGRESS",
+    "claimed": "CLAIMED",
+    "idle": "IDLE",
+    "notloaded": "NOT_LOADED",
+    "not_loaded": "NOT_LOADED",
+    "completed": "COMPLETED",
+    "complete": "COMPLETED",
+    "archived": "ARCHIVED",
+    "closed": "CLOSED",
+    "blocked": "BLOCKED",
+}
 
 
 def now_local() -> datetime:
@@ -80,6 +101,416 @@ def read_json_object(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"{path} must contain a JSON object")
     return payload
+
+
+def normalize_realtime_thread_status(value: Any) -> str:
+    """Normalize Codex app status without treating unknown values as active."""
+
+    raw = str(value or "").strip()
+    if not raw:
+        return "UNKNOWN"
+    key = raw.lower().replace("-", "_").replace(" ", "_")
+    return REALTIME_STATUS_ALIASES.get(key, raw.upper())
+
+
+def _unsynced_thread_status_projection(
+    projection_path: Path,
+    error: str,
+) -> dict[str, Any]:
+    """Return a fail-closed status projection.
+
+    The workgroup runtime's historical member flag is deliberately not used as
+    a fallback.  A missing or malformed projection therefore yields no live
+    counts instead of a plausible-looking but false active count.
+    """
+
+    return {
+        "schema_version": THREAD_STATUS_PROJECTION_SCHEMA_VERSION,
+        "status_sync": "UNSYNCED",
+        "generated_at": None,
+        "source": "codex_app.list_threads projection unavailable",
+        "error": error,
+        "projection_path": str(projection_path),
+        "threads": [],
+        "index": {},
+    }
+
+
+def read_codex_thread_status_projection(
+    projection_path: Path,
+) -> dict[str, Any]:
+    """Read a live Codex thread-status snapshot in read-only mode.
+
+    Codex's application-level ``list_threads`` status is not stored in the
+    normal thread catalog SQLite table.  The app/control-plane bridge writes a
+    small JSON projection with an explicit source and timestamp; this reader
+    only consumes it.  It never falls back to ``members.json`` or to the
+    catalog's ``updated_at`` value because neither proves that a task is live.
+    """
+
+    if not projection_path.is_file():
+        return _unsynced_thread_status_projection(
+            projection_path,
+            "实时线程状态投影文件不存在",
+        )
+    try:
+        payload = read_json_object(projection_path)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        return _unsynced_thread_status_projection(
+            projection_path,
+            f"实时线程状态投影读取失败：{error}",
+        )
+    schema_version = str(payload.get("schema_version") or "")
+    generated_at = str(payload.get("generated_at") or "").strip()
+    source = str(payload.get("source") or "").strip()
+    raw_threads = payload.get("threads")
+    if schema_version != THREAD_STATUS_PROJECTION_SCHEMA_VERSION:
+        return _unsynced_thread_status_projection(
+            projection_path,
+            "实时线程状态投影schema不匹配",
+        )
+    if not generated_at or not source or not isinstance(raw_threads, list):
+        return _unsynced_thread_status_projection(
+            projection_path,
+            "实时线程状态投影缺少generated_at/source/threads",
+        )
+
+    index: dict[str, dict[str, Any]] = {}
+    normalized_threads: list[dict[str, Any]] = []
+    for raw in raw_threads:
+        if not isinstance(raw, dict):
+            return _unsynced_thread_status_projection(
+                projection_path,
+                "实时线程状态投影包含非对象条目",
+            )
+        thread_id = str(raw.get("thread_id") or raw.get("id") or "").strip()
+        if not thread_id:
+            return _unsynced_thread_status_projection(
+                projection_path,
+                "实时线程状态投影包含缺少thread_id的条目",
+            )
+        if thread_id in index:
+            return _unsynced_thread_status_projection(
+                projection_path,
+                "实时线程状态投影包含重复thread_id",
+            )
+        status = normalize_realtime_thread_status(raw.get("status"))
+        title = str(raw.get("title") or raw.get("name") or "").strip()
+        item = {
+            "thread_id": thread_id,
+            "title": title if is_valid_codex_task_title(title) else UNRESOLVED_TASK_TITLE,
+            "status": status,
+            "updated_at": raw.get("updated_at"),
+            "project_id": str(raw.get("project_id") or "").strip() or None,
+        }
+        index[thread_id] = item
+        normalized_threads.append(item)
+
+    return {
+        "schema_version": schema_version,
+        "status_sync": "SYNCED",
+        "generated_at": generated_at,
+        "source": source,
+        "error": None,
+        "projection_path": str(projection_path),
+        "threads": normalized_threads,
+        "index": index,
+    }
+
+
+def _parse_status_timestamp(value: Any) -> datetime | None:
+    """Parse a projection/catalog timestamp without treating it as status."""
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        numeric = float(value)
+        if numeric > 10_000_000_000:
+            numeric /= 1000.0
+        try:
+            return datetime.fromtimestamp(numeric, tz=datetime.now().astimezone().tzinfo)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                return _parse_status_timestamp(float(value.strip()))
+            except ValueError:
+                return None
+        return parsed.astimezone() if parsed.tzinfo is not None else parsed.astimezone()
+    return None
+
+
+def _status_age_ms(value: Any, *, now: datetime | None = None) -> int | None:
+    parsed = _parse_status_timestamp(value)
+    if parsed is None:
+        return None
+    current = now or datetime.now().astimezone()
+    return max(0, int((current - parsed).total_seconds() * 1000))
+
+
+def _read_state_db_status_rows(
+    database_path: Path,
+    thread_ids: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Read an optional status-capable Codex state DB in SQLite read-only mode.
+
+    Current Codex ``state_5.sqlite`` versions expose a thread catalog but no
+    live status column.  This adapter deliberately reports that limitation
+    instead of inferring ACTIVE from ``updated_at``.  Test/forward-compatible
+    databases that expose ``status`` plus a timestamp can be consumed here.
+    """
+
+    result: dict[str, Any] = {
+        "available": False,
+        "status_available": False,
+        "source": "codex_state_5.sqlite",
+        "error": None,
+        "threads": [],
+        "index": {},
+    }
+    if not database_path or not database_path.is_file():
+        result["error"] = "state_5.sqlite不存在"
+        return result
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{database_path.resolve().as_posix()}?mode=ro",
+            uri=True,
+            timeout=1,
+        )
+        result["available"] = True
+        columns = {
+            str(row[1]).lower(): str(row[1])
+            for row in connection.execute("PRAGMA table_info(threads)").fetchall()
+        }
+        id_column = columns.get("id") or columns.get("thread_id")
+        status_column = next(
+            (columns[name] for name in ("status", "state", "thread_status") if name in columns),
+            None,
+        )
+        timestamp_column = next(
+            (
+                columns[name]
+                for name in (
+                    "status_observed_at",
+                    "status_updated_at",
+                    "updated_at_ms",
+                    "updated_at",
+                )
+                if name in columns
+            ),
+            None,
+        )
+        if not id_column or not status_column:
+            result["error"] = "state_5.sqlite仅提供线程目录，未提供实时status字段"
+            return result
+        result["status_available"] = True
+        selected_ids = [str(value) for value in (thread_ids or []) if str(value)]
+        query = (
+            f"SELECT {id_column}, {status_column}, "
+            f"{timestamp_column or 'NULL'} FROM threads"
+        )
+        parameters: list[str] = []
+        if selected_ids:
+            placeholders = ",".join("?" for _ in selected_ids)
+            query += f" WHERE {id_column} IN ({placeholders})"
+            parameters.extend(selected_ids)
+        rows = connection.execute(query, parameters).fetchall()
+        for thread_id, raw_status, observed_at in rows:
+            key = str(thread_id or "").strip()
+            if not key:
+                continue
+            item = {
+                "thread_id": key,
+                "status": normalize_realtime_thread_status(raw_status),
+                "worker_status": normalize_realtime_thread_status(raw_status),
+                "status_stale": False,
+                "status_observed_at": observed_at,
+                "status_age_ms": _status_age_ms(observed_at),
+                "status_source": result["source"],
+            }
+            result["threads"].append(item)
+            result["index"][key] = item
+        return result
+    except (OSError, sqlite3.Error) as error:
+        result["error"] = f"state_5.sqlite读取失败：{error}"
+        return result
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _stale_status_snapshot(
+    projection: dict[str, Any],
+    *,
+    state_db: dict[str, Any],
+    max_age_seconds: float,
+    thread_ids: Iterable[str] | None,
+) -> dict[str, Any]:
+    """Return a status snapshot that cannot preserve historical ACTIVE."""
+
+    generated_at = projection.get("generated_at")
+    age_ms = _status_age_ms(generated_at)
+    requested = {str(value) for value in (thread_ids or []) if str(value)}
+    source_index = projection.get("index") or {}
+    rows: list[dict[str, Any]] = []
+    keys = requested or set(source_index)
+    for thread_id in sorted(keys):
+        source_item = source_index.get(thread_id) or {}
+        item = {
+            "thread_id": thread_id,
+            "title": source_item.get("title") or UNRESOLVED_TASK_TITLE,
+            "status": UNKNOWN_STALE_THREAD_STATUS,
+            "worker_status": UNKNOWN_STALE_THREAD_STATUS,
+            "status_stale": True,
+            "status_observed_at": generated_at,
+            "status_source": projection.get("source") or "codex_app.list_threads",
+            "status_age_ms": age_ms,
+            "project_id": source_item.get("project_id"),
+        }
+        rows.append(item)
+    projection_error = projection.get("error") or (
+        f"实时线程状态快照超过{max_age_seconds:g}秒，拒绝使用历史状态"
+        if age_ms is not None
+        else "实时线程状态快照缺少可验证时间"
+    )
+    db_note = state_db.get("error")
+    error = f"{projection_error}；{db_note}" if db_note else projection_error
+    source = "+".join(
+        value
+        for value in (
+            str(projection.get("source") or "projection"),
+            "codex_state_5.sqlite catalog",
+        )
+        if value
+    )
+    index = {row["thread_id"]: row for row in rows}
+    return {
+        "schema_version": THREAD_STATUS_PROJECTION_SCHEMA_VERSION,
+        "status_sync": "STALE_STATUS",
+        "generated_at": generated_at,
+        "status_observed_at": generated_at,
+        "status_age_ms": age_ms,
+        "source": source,
+        "error": error,
+        "threads": rows,
+        "index": index,
+        "state_db_status_available": bool(state_db.get("status_available")),
+        "fail_closed": True,
+    }
+
+
+def read_codex_thread_status_snapshot(
+    projection_path: Path,
+    state_db_path: Path | None = None,
+    *,
+    thread_ids: Iterable[str] | None = None,
+    max_age_seconds: float = DEFAULT_REALTIME_STATUS_MAX_AGE_SECONDS,
+) -> dict[str, Any]:
+    """Read current worker status with freshness and fail-closed semantics.
+
+    The JSON projection is accepted only inside the freshness window.  If a
+    status-capable SQLite schema is present, it can replace a stale projection
+    only when its own observed timestamp is fresh.  The normal Codex catalog
+    has no status column, so it is used only to document the limitation.
+    """
+
+    projection = read_codex_thread_status_projection(projection_path)
+    now = datetime.now().astimezone()
+    projection_age = _status_age_ms(projection.get("generated_at"), now=now)
+    limit_ms = max(0, int(float(max_age_seconds) * 1000))
+    requested_ids = [str(value) for value in (thread_ids or []) if str(value)]
+    state_db = _read_state_db_status_rows(state_db_path, requested_ids) if state_db_path else {
+        "available": False,
+        "status_available": False,
+        "source": "codex_state_5.sqlite",
+        "error": "未配置state_5.sqlite",
+        "threads": [],
+        "index": {},
+    }
+    if projection.get("status_sync") == "SYNCED" and projection_age is not None and projection_age <= limit_ms:
+        result = copy.deepcopy(projection)
+        for item in result.get("threads") or []:
+            item["worker_status"] = item.get("status") or "UNKNOWN"
+            item["status_observed_at"] = projection.get("generated_at")
+            item["status_source"] = projection.get("source")
+            item["status_age_ms"] = projection_age
+            item["status_stale"] = False
+        result.update(
+            {
+                "status_observed_at": projection.get("generated_at"),
+                "status_age_ms": projection_age,
+                "state_db_status_available": bool(state_db.get("status_available")),
+                "fail_closed": False,
+            }
+        )
+        return result
+    if state_db.get("status_available"):
+        fresh_rows = [
+            row
+            for row in state_db.get("threads") or []
+            if row.get("status_age_ms") is not None
+            and int(row["status_age_ms"]) <= limit_ms
+        ]
+        if fresh_rows and (not requested_ids or {row["thread_id"] for row in fresh_rows} >= set(requested_ids)):
+            index = {row["thread_id"]: row for row in fresh_rows}
+            return {
+                "schema_version": THREAD_STATUS_PROJECTION_SCHEMA_VERSION,
+                "status_sync": "SYNCED",
+                "generated_at": max(
+                    (row.get("status_observed_at") for row in fresh_rows),
+                    key=lambda value: str(value),
+                ),
+                "status_observed_at": max(
+                    (row.get("status_observed_at") for row in fresh_rows),
+                    key=lambda value: str(value),
+                ),
+                "status_age_ms": max(int(row["status_age_ms"]) for row in fresh_rows),
+                "source": state_db.get("source"),
+                "error": None,
+                "threads": fresh_rows,
+                "index": index,
+                "state_db_status_available": True,
+                "fail_closed": False,
+            }
+    return _stale_status_snapshot(
+        projection,
+        state_db=state_db,
+        max_age_seconds=max_age_seconds,
+        thread_ids=requested_ids,
+    )
+
+
+def realtime_thread_status_summary(
+    projection: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a public-safe summary; raw thread IDs stay inside the adapter."""
+
+    threads = projection.get("threads") or []
+    status_counts: dict[str, int] = {}
+    for thread in threads:
+        status = str(thread.get("status") or "UNKNOWN")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    active_count = (
+        sum(
+            1
+            for thread in threads
+            if str(thread.get("status") or "") in REALTIME_ACTIVE_THREAD_STATES
+        )
+        if projection.get("status_sync") == "SYNCED"
+        else None
+    )
+    return {
+        "schema_version": projection.get("schema_version"),
+        "status_sync": projection.get("status_sync", "UNSYNCED"),
+        "generated_at": projection.get("generated_at"),
+        "source": projection.get("source"),
+        "error": projection.get("error"),
+        "visible_thread_count": len(threads) if projection.get("status_sync") == "SYNCED" else None,
+        "active_thread_count": active_count,
+        "status_counts": status_counts if projection.get("status_sync") == "SYNCED" else {},
+    }
 
 
 def parse_datetime(value: Any) -> datetime | None:
@@ -1664,11 +2095,52 @@ def build_context_projection(
     }
 
 
+def _member_realtime_projection(
+    member: dict[str, Any],
+    thread_status_projection: dict[str, Any],
+) -> dict[str, Any]:
+    """Join one registered member to the latest read-only Codex snapshot."""
+
+    historical_active = member_is_active(member)
+    thread_id = str(member.get("thread_id") or "")
+    synced = thread_status_projection.get("status_sync") == "SYNCED"
+    index = thread_status_projection.get("index") or {}
+    observed = index.get(thread_id) if synced and thread_id else None
+    if synced and observed is not None:
+        realtime_status = str(observed.get("status") or "UNKNOWN")
+        realtime_active: bool | None = realtime_status in REALTIME_ACTIVE_THREAD_STATES
+        sync_state = "SYNCED"
+    elif synced:
+        realtime_status = "NOT_VISIBLE"
+        realtime_active = False
+        sync_state = "SYNCED_NOT_VISIBLE"
+    else:
+        realtime_status = "UNSYNCED"
+        realtime_active = None
+        sync_state = "UNSYNCED"
+    conflict = (
+        synced
+        and realtime_active is not None
+        and historical_active != realtime_active
+    )
+    return {
+        "workgroup_marker_active": historical_active,
+        "workgroup_marker_status": str(member.get("status") or ("ACTIVE" if historical_active else "RELEASED")),
+        "codex_realtime_status": realtime_status,
+        "codex_realtime_active": realtime_active,
+        "realtime_sync_state": sync_state,
+        "status_conflict": conflict,
+        "status_snapshot_at": thread_status_projection.get("generated_at"),
+        "status_source": thread_status_projection.get("source"),
+    }
+
+
 def safe_group_row(
     group_dir: Path,
     *,
     codex_state_db: Path,
     title_map_path: Path,
+    thread_status_projection: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     group_path = group_dir / "group.json"
     members_path = group_dir / "members.json"
@@ -1696,47 +2168,62 @@ def safe_group_row(
         ],
         title_map_path,
     )
+    thread_status_projection = thread_status_projection or _unsynced_thread_status_projection(
+        group_dir.parent / DEFAULT_THREAD_STATUS_PROJECTION_NAME,
+        "未提供实时线程状态投影",
+    )
     controller_member_id = str(group.get("controller_member_id") or "")
     safe_members: list[dict[str, Any]] = []
+    registered_members: list[dict[str, Any]] = []
     role_counts: dict[str, int] = {}
     for member in member_rows:
         role = str(member.get("role") or "unknown")
         active = member_is_active(member)
-        if not active:
-            continue
-        role_counts[role] = role_counts.get(role, 0) + 1
         member_id = str(member.get("member_id") or "")
         thread_id = str(member.get("thread_id") or "")
         member_title = str(member.get("codex_task_title") or "").strip()
         if not is_valid_codex_task_title(member_title):
             member_title = ""
         resolved_title = member_title or title_map.get(thread_id)
+        observed_thread = (
+            (thread_status_projection.get("index") or {}).get(thread_id)
+            if thread_status_projection.get("status_sync") == "SYNCED"
+            else None
+        )
+        if not member_title and not is_valid_codex_task_title(resolved_title):
+            observed_title = str((observed_thread or {}).get("title") or "").strip()
+            if is_valid_codex_task_title(observed_title):
+                resolved_title = observed_title
         if not is_valid_codex_task_title(resolved_title):
             resolved_title = UNRESOLVED_TASK_TITLE
-        safe_members.append(
-            {
-                "member_id": member_id,
-                "conversation_title": resolved_title,
-                "conversation_title_source": (
-                    "member_verified_codex_task_title"
-                    if member_title
-                    else (
-                        "verified_thread_title_map_or_database"
-                        if resolved_title != UNRESOLVED_TASK_TITLE
-                        else "unresolved_fail_closed"
-                    )
-                ),
-                "role": role,
-                "role_label": ROLE_LABELS.get(role, role),
-                "active": True,
-                "status": "活跃",
-                "is_controller": (
-                    member_id == controller_member_id or role == "controller"
-                ),
-                "joined_at": member.get("joined_at") or member.get("added_at"),
-                "lease_expires_at": member.get("lease_expires_at"),
-            }
-        )
+        realtime = _member_realtime_projection(member, thread_status_projection)
+        row = {
+            "member_id": member_id,
+            "conversation_title": resolved_title,
+            "conversation_title_source": (
+                "member_verified_codex_task_title"
+                if member_title
+                else (
+                    "verified_thread_title_map_or_database"
+                    if resolved_title != UNRESOLVED_TASK_TITLE
+                    else "unresolved_fail_closed"
+                )
+            ),
+            "role": role,
+            "role_label": ROLE_LABELS.get(role, role),
+            "active": active,
+            "status": "活跃" if active else "已释放/历史",
+            "is_controller": (
+                member_id == controller_member_id or role == "controller"
+            ),
+            "joined_at": member.get("joined_at") or member.get("added_at"),
+            "lease_expires_at": member.get("lease_expires_at"),
+            **realtime,
+        }
+        registered_members.append(row)
+        if active:
+            role_counts[role] = role_counts.get(role, 0) + 1
+            safe_members.append(row)
     safe_members.sort(
         key=lambda row: (
             not row["is_controller"],
@@ -1744,6 +2231,50 @@ def safe_group_row(
             row["conversation_title"],
         )
     )
+    registered_members.sort(
+        key=lambda row: (
+            not row["is_controller"],
+            not row["workgroup_marker_active"],
+            row["role"],
+            row["conversation_title"],
+        )
+    )
+    synced = thread_status_projection.get("status_sync") == "SYNCED"
+    group_thread_ids = {
+        str(member.get("thread_id") or "")
+        for member in member_rows
+        if str(member.get("thread_id") or "")
+    }
+    if synced:
+        realtime_active_member_count: int | None = sum(
+            bool(row.get("codex_realtime_active")) for row in registered_members
+        )
+        realtime_status_counts: dict[str, int] = {}
+        for row in registered_members:
+            status = str(row.get("codex_realtime_status") or "UNKNOWN")
+            realtime_status_counts[status] = realtime_status_counts.get(status, 0) + 1
+        unassigned_active_tasks = []
+        for thread in thread_status_projection.get("threads") or []:
+            if str(thread.get("status") or "") not in REALTIME_ACTIVE_THREAD_STATES:
+                continue
+            thread_id = str(thread.get("thread_id") or "")
+            if thread_id in group_thread_ids:
+                continue
+            title = str(thread.get("title") or UNRESOLVED_TASK_TITLE)
+            unassigned_active_tasks.append(
+                {
+                    "conversation_title": title if is_valid_codex_task_title(title) else UNRESOLVED_TASK_TITLE,
+                    "codex_realtime_status": str(thread.get("status") or "UNKNOWN"),
+                    "realtime_active": True,
+                    "status_snapshot_at": thread_status_projection.get("generated_at"),
+                    "status_source": thread_status_projection.get("source"),
+                    "relation": "项目活动任务｜未归属当前工作组",
+                }
+            )
+    else:
+        realtime_active_member_count = None
+        realtime_status_counts = {}
+        unassigned_active_tasks = []
 
     return {
         "group_id": str(group.get("group_id") or group_dir.name),
@@ -1760,10 +2291,21 @@ def safe_group_row(
             group.get("state") or group.get("status") or "UNKNOWN"
         ).upper(),
         "active": group_is_active(group),
+        # Legacy aliases are retained for old LoopX readers, but the UI must
+        # use the explicitly named metrics below.
         "active_member_count": len(safe_members),
         "total_member_count": len(safe_members),
+        "registered_member_count": len(member_rows),
+        "historical_active_member_count": len(safe_members),
+        "realtime_active_member_count": realtime_active_member_count,
+        "realtime_status_sync": "SYNCED" if synced else "UNSYNCED",
+        "realtime_status_source": thread_status_projection.get("source"),
+        "realtime_status_snapshot_at": thread_status_projection.get("generated_at"),
+        "realtime_status_counts": realtime_status_counts,
+        "unassigned_active_tasks": unassigned_active_tasks,
         "role_counts": role_counts,
         "members": safe_members,
+        "registered_members": registered_members,
         "created_at": group.get("created_at"),
         "closed_at": group.get("closed_at"),
         "expires_at": group.get("expires_at"),
@@ -1774,8 +2316,15 @@ def build_workgroup_status(
     runtime_root: Path,
     codex_state_db: Path = DEFAULT_CODEX_STATE_DB,
     title_map_path: Path | None = None,
+    thread_status_projection_path: Path | None = None,
 ) -> dict[str, Any]:
     resolved_title_map = title_map_path or (runtime_root / "CODEX_THREAD_TITLE_MAP.json")
+    resolved_thread_status_path = thread_status_projection_path or (
+        runtime_root / DEFAULT_THREAD_STATUS_PROJECTION_NAME
+    )
+    thread_status_projection = read_codex_thread_status_projection(
+        resolved_thread_status_path
+    )
     groups: list[dict[str, Any]] = []
     if runtime_root.is_dir():
         for group_dir in sorted(runtime_root.iterdir(), key=lambda path: path.name):
@@ -1785,6 +2334,7 @@ def build_workgroup_status(
                 group_dir,
                 codex_state_db=codex_state_db,
                 title_map_path=resolved_title_map,
+                thread_status_projection=thread_status_projection,
             )
             if row is not None:
                 groups.append(row)
@@ -1792,7 +2342,7 @@ def build_workgroup_status(
     empty_active_groups = [
         row
         for row in groups
-        if row["active"] and row["active_member_count"] == 0
+        if row["active"] and row["registered_member_count"] == 0
     ]
     visible_groups = [row for row in groups if row not in empty_active_groups]
     active_groups = [row for row in visible_groups if row["active"]]
@@ -1816,6 +2366,12 @@ def build_workgroup_status(
         "display_name": "工作组",
         "active_group_count": len(active_groups),
         "active_member_count": active_members,
+        "historical_active_member_count": sum(
+            row["historical_active_member_count"] for row in active_groups
+        ),
+        "realtime_thread_status": realtime_thread_status_summary(
+            thread_status_projection
+        ),
         "role_counts": role_counts,
         "active_groups": active_groups,
         "recent_groups": recent_groups,
@@ -1869,6 +2425,7 @@ def group_detail_projection(
     *,
     codex_state_db: Path = DEFAULT_CODEX_STATE_DB,
     title_map_path: Path | None = None,
+    thread_status_projection_path: Path | None = None,
 ) -> dict[str, Any] | None:
     group_dir = runtime_root / group_id
     group = load_optional_json(group_dir / "group.json")
@@ -1879,6 +2436,12 @@ def group_detail_projection(
     if not isinstance(raw_members, dict):
         raw_members = {}
     resolved_title_map = title_map_path or (runtime_root / "CODEX_THREAD_TITLE_MAP.json")
+    resolved_thread_status_path = thread_status_projection_path or (
+        runtime_root / DEFAULT_THREAD_STATUS_PROJECTION_NAME
+    )
+    thread_status_projection = read_codex_thread_status_projection(
+        resolved_thread_status_path
+    )
     title_map = load_codex_thread_titles(
         codex_state_db,
         [str(item.get("thread_id") or "") for item in raw_members.values() if isinstance(item, dict)],
@@ -1902,6 +2465,7 @@ def group_detail_projection(
         group_dir,
         codex_state_db=codex_state_db,
         title_map_path=resolved_title_map,
+        thread_status_projection=thread_status_projection,
     )
     if group_row is None:
         return None
@@ -1933,6 +2497,18 @@ def group_detail_projection(
         "objective": group_row["objective"],
         "state": group_row["state"],
         "members": group_row["members"],
+        "registered_members": group_row["registered_members"],
+        "realtime_thread_status": realtime_thread_status_summary(
+            thread_status_projection
+        ),
+        "member_status_contract": {
+            "registered_member_count": group_row["registered_member_count"],
+            "historical_active_member_count": group_row["historical_active_member_count"],
+            "realtime_active_member_count": group_row["realtime_active_member_count"],
+            "realtime_status_sync": group_row["realtime_status_sync"],
+            "status_snapshot_at": group_row["realtime_status_snapshot_at"],
+            "status_source": group_row["realtime_status_source"],
+        },
         "historical_member_count": inactive_member_count,
         "context": context,
         "task_pool": task_pool,
@@ -1959,12 +2535,14 @@ def exact_entry_projection(
     *,
     codex_state_db: Path = DEFAULT_CODEX_STATE_DB,
     title_map_path: Path | None = None,
+    thread_status_projection_path: Path | None = None,
 ) -> dict[str, Any] | None:
     detail = group_detail_projection(
         runtime_root,
         group_id,
         codex_state_db=codex_state_db,
         title_map_path=title_map_path,
+        thread_status_projection_path=thread_status_projection_path,
     )
     if detail is None:
         return None
@@ -2003,7 +2581,9 @@ def build_loopx_projection(status: dict[str, Any]) -> dict[str, Any]:
     for group in status["active_groups"]:
         used_names: dict[str, int] = {}
         for member in group["members"]:
-            if not member["active"]:
+            if group.get("realtime_status_sync") != "SYNCED":
+                continue
+            if member.get("codex_realtime_active") is not True:
                 continue
             title = member["conversation_title"]
             used_names[title] = used_names.get(title, 0) + 1
@@ -2355,6 +2935,12 @@ def render_html() -> str:
     .member-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; }
     .member-card { min-width: 0; }
     .member-card.history { opacity: .82; border-color: rgba(243, 195, 109, .32); }
+    .member-card.status-conflict { border-color: rgba(255, 127, 135, .72); background: rgba(88, 35, 43, .24); }
+    .member-card.status-unsynced { border-color: rgba(243, 195, 109, .42); }
+    .status-table { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 6px 10px; margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--line-soft); }
+    .status-cell { min-width: 0; color: var(--muted); font-size: 10px; line-height: 1.45; }
+    .status-cell strong { display: block; color: var(--faint); font-size: 9px; font-weight: 700; }
+    .unassigned-list { margin-top: 10px; padding: 10px; border: 1px dashed rgba(243, 195, 109, .48); border-radius: 10px; background: rgba(127, 89, 21, .16); }
     .member-card .claim { margin-top: 10px; color: #dbe8ff; font-size: 12px; line-height: 1.55; }
     .position-timeline { display: grid; gap: 7px; margin: 11px 0 2px; padding: 9px 10px 9px 13px; border-left: 2px solid rgba(120, 170, 255, .42); background: rgba(7, 17, 31, .28); }
     .timeline-step { position: relative; padding-left: 10px; color: var(--muted); font-size: 10px; line-height: 1.45; }
@@ -2427,6 +3013,7 @@ def render_html() -> str:
     ];
     const issueFilter = {status: 'active', severity: 'all'};
     const structuralIssuesApiPath = '/api/structural-issues';
+    const threadStatusApiPath = '/api/thread-status-projection';
     const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
     const text = (value, fallback = '—') => value === null || value === undefined || value === '' ? fallback : String(value);
     const apiUrl = (path, params = {}) => {
@@ -2462,10 +3049,14 @@ def render_html() -> str:
     const renderGroupCard = (group, archived) => {
       const selected = group.group_id === selectedGroupId ? ' selected' : '';
       const state = archived ? '已归档' : (group.state === 'ACTIVE' ? '运行中' : text(group.state));
+      const realtime = group.realtime_status_sync === 'SYNCED'
+        ? `实时运行 ${text(group.realtime_active_member_count, '0')}`
+        : '实时状态未同步';
       return `<button class="group-card ${archived ? 'archived' : ''}${selected}" data-group-id="${escapeHtml(group.group_id)}">
         <div class="group-card-title"><span>${escapeHtml(text(group.display_title, '工作组'))}</span><span class="state-pill ${archived ? 'archived' : ''}">${escapeHtml(state)}</span></div>
         <div class="group-card-meta">${escapeHtml(text(group.objective, '未提供目标'))}</div>
-        <div class="group-card-meta">${archived ? '历史诊断 · ' + escapeHtml(text(group.closed_at)) : '活跃成员 ' + escapeHtml(group.active_member_count) + ' · ' + escapeHtml(text(group.task_id))}</div>
+        <div class="group-card-meta">登记 ${escapeHtml(text(group.registered_member_count, '—'))} · ${escapeHtml(realtime)}</div>
+        <div class="group-card-meta">${archived ? '历史诊断 · ' + escapeHtml(text(group.closed_at)) : escapeHtml(text(group.task_id))}</div>
       </button>`;
     };
     function renderGroupList() {
@@ -2563,7 +3154,17 @@ def render_html() -> str:
       const body = `<div class="issue-filters"><label>状态 <select aria-label="状态筛选" class="issue-filter" data-issue-filter="status">${['all', ...statusOptions].map((value) => `<option value="${value}" ${issueFilter.status === value ? 'selected' : ''}>${value === 'all' ? '全部状态' : issueStatusLabel(value)}</option>`).join('')}</select></label><label>严重度 <select aria-label="严重度筛选" class="issue-filter" data-issue-filter="severity">${severityOptions.map((value) => `<option value="${value}" ${issueFilter.severity === value ? 'selected' : ''}>${value === 'all' ? '全部严重度' : issueSeverityLabel(value)}</option>`).join('')}</select></label><span class="tag amber">显示 ${visible.length}/${allIssues.length}</span></div><div>${cards}</div>`;
       return moduleSection('structural_issues', '重大结构性问题', `默认 active · ${payload?.read_only ? '只读投影' : '来源未声明'} · ${structuralIssuesApiPath}`, body, 'tall');
     };
-    const renderMember = (member) => `<article class="member-card"><div class="member-top"><div><div class="member-title">${escapeHtml(text(member.conversation_title, '任务名称待同步'))}</div><div class="member-detail">${escapeHtml(text(member.role))} · ${escapeHtml(text(member.status))}</div></div>${badge(member.is_controller ? '总控' : '活跃')}</div><div class="member-detail">当前活动成员；任务名称来自 Codex 任务标题适配器。</div></article>`;
+    const renderMember = (member) => {
+      const sync = member.realtime_sync_state === 'SYNCED' || member.realtime_sync_state === 'SYNCED_NOT_VISIBLE';
+      const conflict = member.status_conflict ? ' status-conflict' : (!sync ? ' status-unsynced' : '');
+      const marker = member.workgroup_marker_active ? 'active=true' : 'inactive/released';
+      const realtime = member.codex_realtime_status === 'UNSYNCED' ? '实时状态未同步' : text(member.codex_realtime_status, '未发现');
+      const statusBadge = member.status_conflict ? badge('状态冲突') : (sync ? badge(member.codex_realtime_active ? '实时运行' : '非运行') : badge('未同步'));
+      return `<article class="member-card${conflict}">
+        <div class="member-top"><div><div class="member-title">${escapeHtml(text(member.conversation_title, '任务名称待同步'))}</div><div class="member-detail">${escapeHtml(text(member.role_label || member.role))} · ${member.is_controller ? '总控' : '工作组成员'}</div></div>${statusBadge}</div>
+        <div class="status-table"><div class="status-cell"><strong>工作组标记状态</strong>${escapeHtml(marker)} · ${escapeHtml(text(member.workgroup_marker_status))}</div><div class="status-cell"><strong>Codex实时线程状态</strong>${escapeHtml(realtime)}${member.status_conflict ? ' · 与工作组标记不一致' : ''}</div><div class="status-cell"><strong>状态快照时间</strong>${escapeHtml(text(member.status_snapshot_at, '未同步'))}</div><div class="status-cell"><strong>来源</strong>${escapeHtml(text(member.status_source, '未声明'))}</div></div>
+      </article>`;
+    };
     const renderPositionTimeline = (card, context) => {
       const entries = Array.isArray(context?.entries) ? context.entries : [];
       const ids = [...new Set([card.source_entry_id, ...(card.related_entry_ids || [])].filter(Boolean))];
@@ -2623,10 +3224,24 @@ def render_html() -> str:
       const cards = context.member_position_cards || [];
       const activeCards = cards.filter((card) => card.member_active);
       const historyCards = (context.historical_diagnostic_evidence || cards.filter((card) => !card.member_active));
-      const summaryBody = `<div class="metric-grid">${metric('活动成员', group.active_member_count)}${metric('工作组总流水', context.event_summary?.total_stream_count, 'append-only 全局序号不重写')}${metric('当前核心事件', context.event_summary?.core_event_count, `真实效果 ${context.event_summary?.real_effect_count ?? '—'}`)}${metric('证据事件', context.event_summary?.evidence_count, '当前工作组筛选')}</div>`;
+      const memberContract = detail.member_status_contract || {};
+      const globalRealtime = statusData?.realtime_thread_status || {};
+      const realtimeSynced = memberContract.realtime_status_sync === 'SYNCED';
+      const globalSynced = globalRealtime.status_sync === 'SYNCED';
+      const groupRealtimeLabel = realtimeSynced ? text(memberContract.realtime_active_member_count, '0') : '未同步';
+      const globalRealtimeLabel = globalSynced ? text(globalRealtime.active_thread_count, '0') : '未同步';
+      const summaryBody = `<div class="notice ${realtimeSynced && globalSynced ? '' : 'warn'}">实时线程口径与工作组历史标记分开计算。${realtimeSynced && globalSynced ? '状态投影已同步。' : '实时状态未同步；不会回退使用 active=true。'}${memberContract.status_snapshot_at ? ` 快照：${escapeHtml(memberContract.status_snapshot_at)}` : ''}</div>
+        <div class="section-title" style="margin-top:14px"><span>当前工作组口径</span><small>登记总数 ≠ 历史标记 ≠ Codex实时运行</small></div>
+        <div class="metric-grid">${metric('登记成员', memberContract.registered_member_count)}${metric('组内实时运行任务', groupRealtimeLabel, realtimeSynced ? '按thread_id对账' : '实时状态未同步')}</div>
+        <div class="section-title" style="margin-top:14px"><span>全项目口径</span><small>当前可见 Codex 任务去重</small></div>
+        <div class="metric-grid">${metric('全项目实时运行任务', globalRealtimeLabel, globalSynced ? '独立thread_id去重' : '实时状态未同步')}${metric('全项目可见线程', globalSynced ? globalRealtime.visible_thread_count : '未同步')}${metric('全项目状态分布', globalSynced ? JSON.stringify(globalRealtime.status_counts || {}) : '未同步')}</div>
+        <div class="metric-grid" style="margin-top:12px">${metric('工作组总流水', context.event_summary?.total_stream_count, 'append-only 全局序号不重写')}${metric('当前核心事件', context.event_summary?.core_event_count, `真实效果 ${context.event_summary?.real_effect_count ?? '—'}`)}${metric('证据事件', context.event_summary?.evidence_count, '当前工作组筛选')}${metric('未归属当前组的项目活动任务', (group.unassigned_active_tasks || []).length, '只在实时状态已同步时统计')}</div>`;
       const contextBody = `${renderBudget(context)}<div class="metric-grid" style="margin-top:12px">${metric('原始候选', retrieval.full_visible_entry_count)}${metric('遗漏条目', retrieval.omitted_entry_count)}${metric('遗漏成员观点', metrics.omitted_member_opinion_count ?? 0)}${metric('重复率', percent(metrics.duplicate_rate))}${metric('检索补充', metrics.retrieval_supplement_count ?? 0)}${metric('检索延迟', metrics.latency_ms == null ? '—' : `${metrics.latency_ms} ms`)}${metric('开放冲突', (context.open_conflict_entry_ids || []).length)}${metric('开放问题', (context.open_question_entry_ids || []).length)}</div>${retrieval.omitted_entry_count ? '<div class="notice warn">当前切片存在截断；遗漏条目仍可通过精确引用检索，不等于丢失原始记忆。</div>' : ''}`;
       const positionBody = `<div class="member-grid">${activeCards.length ? activeCards.map((card) => renderCard(card, false, context)).join('') : '<div class="empty">当前没有可展示的活动成员观点卡。</div>'}</div>`;
-      const membersBody = `<div class="member-grid">${(group.members || []).length ? group.members.map(renderMember).join('') : '<div class="empty">暂无活动成员。</div>'}</div>`;
+      const registeredMembers = group.registered_members || group.members || [];
+      const unassigned = group.unassigned_active_tasks || [];
+      const unassignedBody = unassigned.length ? `<div class="unassigned-list"><div class="member-detail"><b>项目活动任务｜未归属当前工作组</b> · 这些任务在当前实时快照中运行，但尚未出现在本组 members.json。</div>${unassigned.map((item) => `<div class="member-detail">${escapeHtml(text(item.conversation_title, '任务名称待同步'))} · ${escapeHtml(text(item.codex_realtime_status))} · 快照 ${escapeHtml(text(item.status_snapshot_at))}</div>`).join('')}</div>` : (!realtimeSynced ? '<div class="notice warn">无法取得实时线程状态时，不推断未归属任务。</div>' : '');
+      const membersBody = `<div class="member-grid">${registeredMembers.length ? registeredMembers.map(renderMember).join('') : '<div class="empty">暂无登记成员。</div>'}</div>${unassignedBody}`;
       const historySection = moduleEnabled('history') ? `<details class="section module-section" data-module="history"><summary class="section-title"><span>历史诊断证据区</span><small>${historyCards.length} 张历史观点卡 · 不参与当前 claim</small></summary><div class="module-scroll"><div class="member-grid" style="margin-top:12px">${historyCards.length ? historyCards.map((card) => renderCard(card, true, context)).join('') : '<div class="empty">暂无已退出成员的历史诊断证据。</div>'}</div></div></details>` : '';
       const boundaryBody = `<div class="notice">${escapeHtml(text(context.notice))}<br>当前页只读；不会自动 claim、不会重启任务、不会把历史成员重新放回活动成员列表。</div>`;
       const html = `<div class="detail-inner">
@@ -2637,7 +3252,7 @@ def render_html() -> str:
         ${renderTaskPool(detail.task_pool || {})}
         ${renderStructuralIssues(structuralIssues)}
         ${moduleSection('position_cards', '当前成员观点卡 · member_position_cards', `${activeCards.length} 名活动成员 · 已退出成员不占活动位`, positionBody, 'tall')}
-        ${moduleSection('members', '当前工作组成员', '实际 Codex 任务名称', membersBody, 'compact')}
+        ${moduleSection('members', '工作组成员状态对账', '登记成员 · 工作组标记状态 · Codex实时线程状态', membersBody, 'tall')}
         ${renderEntries(context)}
         ${historySection}
         ${moduleSection('boundary', '来源与边界', '不改变 project truth', boundaryBody, 'compact')}
@@ -2752,6 +3367,7 @@ class WorkgroupStatusHandler(BaseHTTPRequestHandler):
     runtime_root = DEFAULT_RUNTIME_ROOT
     codex_state_db = DEFAULT_CODEX_STATE_DB
     title_map_path = DEFAULT_TITLE_MAP
+    thread_status_projection_path: Path | None = None
 
     def send_payload(
         self,
@@ -2781,10 +3397,16 @@ class WorkgroupStatusHandler(BaseHTTPRequestHandler):
             if demo_mode
             else self.title_map_path
         )
+        thread_status_projection_path = (
+            runtime_root / DEFAULT_THREAD_STATUS_PROJECTION_NAME
+            if demo_mode
+            else self.thread_status_projection_path
+        )
         status = build_workgroup_status(
             runtime_root,
             codex_state_db=self.codex_state_db,
             title_map_path=title_map_path,
+            thread_status_projection_path=thread_status_projection_path,
         )
         status["demo_mode"] = demo_mode
         if path in {"/", "/index.html"}:
@@ -2811,6 +3433,7 @@ class WorkgroupStatusHandler(BaseHTTPRequestHandler):
                 group_id,
                 codex_state_db=self.codex_state_db,
                 title_map_path=title_map_path,
+                thread_status_projection_path=thread_status_projection_path,
             ) if group_id else None
             if detail is None:
                 self.send_payload(
@@ -2835,6 +3458,7 @@ class WorkgroupStatusHandler(BaseHTTPRequestHandler):
                 entry_id,
                 codex_state_db=self.codex_state_db,
                 title_map_path=title_map_path,
+                thread_status_projection_path=thread_status_projection_path,
             ) if group_id and entry_id else None
             if entry is None:
                 self.send_payload(
@@ -2870,6 +3494,21 @@ class WorkgroupStatusHandler(BaseHTTPRequestHandler):
                     "utf-8"
                 ),
                 content_type="application/json; charset=utf-8",
+            )
+            return
+        if path == "/api/thread-status-projection":
+            projection = read_codex_thread_status_projection(
+                thread_status_projection_path
+                or (runtime_root / DEFAULT_THREAD_STATUS_PROJECTION_NAME)
+            )
+            self.send_payload(
+                (json.dumps(
+                    realtime_thread_status_summary(projection),
+                    ensure_ascii=False,
+                    indent=2,
+                ) + "\n").encode("utf-8"),
+                content_type="application/json; charset=utf-8",
+                status_code=200,
             )
             return
         if path == "/loopx/status.json":
@@ -2918,6 +3557,11 @@ def main() -> int:
     parser.add_argument("--runtime-root", default=str(DEFAULT_RUNTIME_ROOT))
     parser.add_argument("--codex-state-db", default=str(DEFAULT_CODEX_STATE_DB))
     parser.add_argument("--title-map", default=str(DEFAULT_TITLE_MAP))
+    parser.add_argument(
+        "--thread-status-projection",
+        default="",
+        help="codex_app.list_threads 只读状态投影；缺失时严格显示未同步",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     snapshot = subparsers.add_parser("snapshot")
@@ -2932,12 +3576,18 @@ def main() -> int:
     runtime_root = Path(args.runtime_root).resolve()
     codex_state_db = Path(args.codex_state_db).resolve()
     title_map_path = Path(args.title_map).resolve()
+    thread_status_projection_path = (
+        Path(args.thread_status_projection).resolve()
+        if args.thread_status_projection
+        else runtime_root / DEFAULT_THREAD_STATUS_PROJECTION_NAME
+    )
 
     if args.command == "snapshot":
         status = build_workgroup_status(
             runtime_root,
             codex_state_db=codex_state_db,
             title_map_path=title_map_path,
+            thread_status_projection_path=thread_status_projection_path,
         )
         if args.output:
             atomic_write_json(Path(args.output).resolve(), status)
@@ -2952,6 +3602,7 @@ def main() -> int:
     WorkgroupStatusHandler.runtime_root = runtime_root
     WorkgroupStatusHandler.codex_state_db = codex_state_db
     WorkgroupStatusHandler.title_map_path = title_map_path
+    WorkgroupStatusHandler.thread_status_projection_path = thread_status_projection_path
     server = ThreadingHTTPServer((args.host, args.port), WorkgroupStatusHandler)
     print(
         json.dumps(

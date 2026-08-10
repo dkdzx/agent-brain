@@ -52,8 +52,9 @@ queue. It never writes the source runtime or host project truth.
 
 ## Implementation status
 
-Version `0.3.0` includes the executable reference core and the read-only
-shadow-memory/recovery adapter:
+Version `0.4.0` includes the executable reference core, the read-only
+shadow-memory/recovery adapter, and the public construction/workgroup
+dashboards:
 
 | Capability | Status |
 |---|---|
@@ -72,6 +73,14 @@ shadow-memory/recovery adapter:
 | LoopX lifecycle reconciliation | Interface boundary only |
 | Raw-session archival and classification pipeline | Design specification only |
 | Host-project authority adapter | Intentionally not included |
+
+The construction dashboard now supports multiple read-only graph presentations
+from the same verified flow graph: layered DAG, tree/radial/force projections,
+local manual arrangement, and a native WebGL 3D view. Chinese and English UI
+labels share the same data contract, and wheel zoom is anchored at the cursor.
+The workgroup dashboard separately reconciles registered membership with a
+fresh Codex thread-status projection and fails closed when that projection is
+missing or stale. See the [v0.4.0 release notes](docs/release-v0.4.0.md).
 
 The architecture diagram shows both the executable core and optional production
 extensions. The [reproduction guide](docs/reproduction-guide.md) is a target
